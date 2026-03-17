@@ -739,6 +739,7 @@ static int nifti_fileexists(const char *fname)
 static int nifti_validfilename(const char *fname)
 {
    if (!fname || !*fname) return 0;
+   if (fname[0] == '-' && fname[1] == '\0') return 1; /* stdin/stdout */
    const char *ext = nifti_find_file_extension(fname);
    if (ext && ext == fname) return 0;
    return 1;
@@ -2077,8 +2078,18 @@ void nifti_image_write(nifti_image *nim)
       if (!fp) return;
    }
 
-   /* seek to data offset and write data */
-   nii_seek(fp, (long)nim->iname_offset, SEEK_SET);
+   /* seek/pad to data offset and write data */
+   if (isStdOut) {
+      /* pipes can't seek — write zero padding from current position to iname_offset */
+      int64_t written = hsize + 4 + nifti_extension_size(nim);
+      int64_t pad = nim->iname_offset - written;
+      if (pad > 0) {
+         char zeros[16] = {0};
+         nii_write(zeros, 1, (size_t)pad, fp);
+      }
+   } else {
+      nii_seek(fp, (long)nim->iname_offset, SEEK_SET);
+   }
    int64_t ntot = (int64_t)nim->nbyper * nim->nvox;
    nii_write(nim->data, 1, ntot, fp);
    nim->byteorder = nifti_short_order();

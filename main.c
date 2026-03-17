@@ -41,6 +41,7 @@
 int show_help( void ) {
 	printf("allineate version %s (%llu-bit %s)\n",kMTHvers, (unsigned long long) sizeof(size_t)*8, kOS);
 	printf(" <moving> <stationary> [opts] <output>: co-register the moving image match the stationary image\n");
+	printf("                 Use '-' for <moving> to read from stdin, '-' for <output> to write to stdout\n");
 	printf("                 opts: -cost XX (hel,lpc,lpa,ls) -cmass -nocmass -source_automask\n");
 	printf("                       -interp XX (NN,linear,cubic) matching interpolation [default: linear]\n");
 	printf("                         NOTE: linear is always used for the coarse pass;\n");
@@ -59,6 +60,11 @@ int main(int argc, char * argv[]) {
 		show_help();
 		return (argc > 1) ? 1 : 0;
 	}
+#ifdef _WIN32
+	/* Set binary mode for stdin/stdout when piping NIfTI data */
+	_setmode(_fileno(stdin), _O_BINARY);
+	_setmode(_fileno(stdout), _O_BINARY);
+#endif
 	int ac = 1;
 	const char *moving_name = argv[ac];
 	ac++;
@@ -74,9 +80,10 @@ int main(int argc, char * argv[]) {
 	const char *output_name = argv[ac];
 	if (ac + 1 < argc)
 		fprintf(stderr, "Warning: ignoring extra arguments after '%s'\n", output_name);
-	/* If output has no recognized NIfTI extension, default to .nii.gz */
+	int isStdOut = (output_name[0] == '-' && output_name[1] == '\0');
+	/* If output has no recognized NIfTI extension, default to .nii.gz (unless stdout) */
 	char *output_ext = NULL;
-	if (!nifti_find_file_extension(output_name)) {
+	if (!isStdOut && !nifti_find_file_extension(output_name)) {
 		size_t len = strlen(output_name);
 		output_ext = (char *)malloc(len + 8); /* .nii.gz + NUL */
 		if (!output_ext) {
@@ -116,7 +123,12 @@ int main(int argc, char * argv[]) {
 			nifti_image_free(stationary);
 			goto cleanup;
 		}
-		if (nifti_set_filenames(stationary, output_name, 0, 0)) {
+		if (isStdOut) {
+			/* stdout: set fname/iname to "-", force single-file NIfTI-1 */
+			free(stationary->fname); stationary->fname = nifti_strdup("-");
+			free(stationary->iname); stationary->iname = nifti_strdup("-");
+			stationary->nifti_type = NIFTI_FTYPE_NIFTI1_1;
+		} else if (nifti_set_filenames(stationary, output_name, 0, 0)) {
 			fprintf(stderr, "Failed to set output filename '%s'\n", output_name);
 			nifti_image_free(stationary);
 			goto cleanup;
@@ -132,7 +144,12 @@ int main(int argc, char * argv[]) {
 			nifti_image_free(moving);
 			goto cleanup;
 		}
-		if (nifti_set_filenames(moving, output_name, 0, 0)) {
+		if (isStdOut) {
+			/* stdout: set fname/iname to "-", force single-file NIfTI-1 */
+			free(moving->fname); moving->fname = nifti_strdup("-");
+			free(moving->iname); moving->iname = nifti_strdup("-");
+			moving->nifti_type = NIFTI_FTYPE_NIFTI1_1;
+		} else if (nifti_set_filenames(moving, output_name, 0, 0)) {
 			fprintf(stderr, "Failed to set output filename '%s'\n", output_name);
 			nifti_image_free(moving);
 			goto cleanup;
@@ -140,13 +157,17 @@ int main(int argc, char * argv[]) {
 		nifti_image_write(moving);
 		nifti_image_free(moving);
 	}
-	/* Verify the output was actually written (nifti_image_write returns void) */
-	FILE *fcheck = fopen(output_name, "rb");
-	if (fcheck) {
-		fclose(fcheck);
-		rc = 0;
+	if (isStdOut) {
+		rc = 0; /* can't verify pipe output */
 	} else {
-		fprintf(stderr, "Failed to write output '%s' (does the directory exist?)\n", output_name);
+		/* Verify the output was actually written (nifti_image_write returns void) */
+		FILE *fcheck = fopen(output_name, "rb");
+		if (fcheck) {
+			fclose(fcheck);
+			rc = 0;
+		} else {
+			fprintf(stderr, "Failed to write output '%s' (does the directory exist?)\n", output_name);
+		}
 	}
 cleanup:
 	free(output_ext);
