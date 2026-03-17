@@ -99,9 +99,7 @@ static mat44 dmat44_to_mat44(nifti_dmat44 d) {
 #define DEFAULT_TBEST_LPA 17
 
 /* Interpolation codes */
-#define AL_INTERP_NN      0
-#define AL_INTERP_LINEAR  1
-#define AL_INTERP_CUBIC   3
+/* Interpolation constants are defined in allineate.h (AL_INTERP_*) */
 
 /* Smooth codes */
 #define GA_SMOOTH_GAUSSIAN 1
@@ -2947,9 +2945,29 @@ static float *nii_to_float(nifti_image *nim)
             double *p = (double *)nim->data;
             for (ii = 0; ii < nvox; ii++) fdata[ii] = (float)p[ii];
         } break;
+        case DT_INT8: {
+            signed char *p = (signed char *)nim->data;
+            for (ii = 0; ii < nvox; ii++) fdata[ii] = (float)p[ii];
+        } break;
+        case DT_UINT16: {
+            unsigned short *p = (unsigned short *)nim->data;
+            for (ii = 0; ii < nvox; ii++) fdata[ii] = (float)p[ii];
+        } break;
+        case DT_UINT32: {
+            unsigned int *p = (unsigned int *)nim->data;
+            for (ii = 0; ii < nvox; ii++) fdata[ii] = (float)p[ii];
+        } break;
+        case DT_INT64: {
+            int64_t *p = (int64_t *)nim->data;
+            for (ii = 0; ii < nvox; ii++) fdata[ii] = (float)p[ii];
+        } break;
+        case DT_UINT64: {
+            uint64_t *p = (uint64_t *)nim->data;
+            for (ii = 0; ii < nvox; ii++) fdata[ii] = (float)p[ii];
+        } break;
         default:
-            /* Best effort: just zero-fill */
-            break;
+            free(fdata);
+            return NULL;
     }
 
     /* Apply scl_slope/scl_inter if set */
@@ -3672,8 +3690,8 @@ int nii_allineate(nifti_image *source, nifti_image *base, al_opts opts)
     int anx = source->nx, any = source->ny, anz = source->nz;
     int bnx = base->nx, bny = base->ny, bnz = base->nz;
 
-    /* Apply final warp */
-    int final_ic = opts.final_interp;
+    /* Apply final warp (default: cubic for registration) */
+    int final_ic = (opts.final_interp == AL_INTERP_DEFAULT) ? AL_INTERP_CUBIC : opts.final_interp;
     const char *interp_name = (final_ic == AL_INTERP_NN) ? "nearest" :
                               (final_ic == AL_INTERP_LINEAR) ? "linear" : "cubic";
     long reg_ms = (long)((al_wtime() - t_start) * 1000.0 + 0.5);
@@ -3735,32 +3753,42 @@ int nii_allineate(nifti_image *source, nifti_image *base, al_opts opts)
 int nii_deface(nifti_image *input, nifti_image *tmpl, nifti_image *mask, al_opts opts)
 {
     double t_start = al_wtime();
+    const char *label = opts.skullstrip ? "Skullstrip" : "Deface";
     if (input == NULL || tmpl == NULL || mask == NULL) {
-        fprintf(stderr, "deface: NULL input image\n");
+        fprintf(stderr, "%s: NULL input image\n", label);
         return 1;
     }
     if (input->datatype != DT_FLOAT32) {
-        fprintf(stderr, "deface: input must be DT_FLOAT32 (got %d)\n", input->datatype);
-        return 1;
+        float *fdata = nii_to_float(input);
+        if (!fdata) {
+            fprintf(stderr, "%s: unsupported input datatype %d\n", label, input->datatype);
+            return 1;
+        }
+        free(input->data);
+        input->data = fdata;
+        input->datatype = DT_FLOAT32;
+        input->nbyper = 4;
+        input->scl_slope = 0.0f;
+        input->scl_inter = 0.0f;
     }
 
     int match_code;
     const char *cost_name;
     al_resolve_cost(opts.cost, &match_code, &cost_name);
-    fprintf(stderr, " + Deface: registering template to input using %s\n", cost_name);
+    fprintf(stderr, " + %s: registering template to input using %s\n", label, cost_name);
 
     /* Register template (moving) to input (fixed) */
     float wpar[12];
     int ok = al_register(tmpl, input, match_code, opts.cmass, 0, opts.interp, wpar);
     if (ok) {
-        fprintf(stderr, "deface: registration failed\n");
+        fprintf(stderr, "%s: registration failed\n", label);
         return 1;
     }
 
     /* Warp mask to input space using the same transform with linear interpolation */
     float *mask_data = nii_to_float(mask);
     if (!mask_data) {
-        fprintf(stderr, "deface: failed to extract mask data\n");
+        fprintf(stderr, "%s: failed to extract mask data\n", label);
         return 1;
     }
 
@@ -3768,13 +3796,17 @@ int nii_deface(nifti_image *input, nifti_image *tmpl, nifti_image *mask, al_opts
     int inx = input->nx, iny = input->ny, inz = input->nz;
     int nvox = inx * iny * inz;
 
-    fprintf(stderr, " + Warping mask to input space\n");
+    /* Default: linear for mask warping (cubic can ring) */
+    int mask_interp = (opts.final_interp == AL_INTERP_DEFAULT) ? AL_INTERP_LINEAR : opts.final_interp;
+    const char *minterp_name = mask_interp == AL_INTERP_NN ? "NN" :
+                               mask_interp == AL_INTERP_CUBIC ? "cubic" : "linear";
+    fprintf(stderr, " + Warping mask to input space (%s interpolation)\n", minterp_name);
     float *warped_mask = al_scalar_warpone(12, wpar, al_wfunc_affine,
                                            mask_data, mnx, mny, mnz,
-                                           inx, iny, inz, AL_INTERP_LINEAR);
+                                           inx, iny, inz, mask_interp);
     free(mask_data);
     if (warped_mask == NULL) {
-        fprintf(stderr, "deface: failed to warp mask\n");
+        fprintf(stderr, "%s: failed to warp mask\n", label);
         return 1;
     }
 
@@ -3798,11 +3830,11 @@ int nii_deface(nifti_image *input, nifti_image *tmpl, nifti_image *mask, al_opts
 #ifdef _OPENMP
     int nthreads = omp_get_max_threads();
     if (nthreads > 1)
-        fprintf(stderr, " + Deface complete: %d of %d voxels masked (%.1f%%; %ldms, %d threads)\n",
-                nmasked, nvox, 100.0f * nmasked / nvox, elapsed_ms, nthreads);
+        fprintf(stderr, " + %s complete: %d of %d voxels masked (%.1f%%; %ldms, %d threads)\n",
+                label, nmasked, nvox, 100.0f * nmasked / nvox, elapsed_ms, nthreads);
     else
 #endif
-        fprintf(stderr, " + Deface complete: %d of %d voxels masked (%.1f%%; %ldms)\n",
-                nmasked, nvox, 100.0f * nmasked / nvox, elapsed_ms);
+        fprintf(stderr, " + %s complete: %d of %d voxels masked (%.1f%%; %ldms)\n",
+                label, nmasked, nvox, 100.0f * nmasked / nvox, elapsed_ms);
     return 0;
 }

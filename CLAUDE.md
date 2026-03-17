@@ -45,6 +45,7 @@ export OMP_NUM_THREADS=10
 ./allineate T1_head MNI152_T1_1mm ./out/wT1
 ./allineate T1_head MNI152_T1_1mm -cmass ./out/wT1cmas
 ./allineate fmri T1_head -cmass -cost lpc -source_automask ./out/fmri2t1
+./allineate MNI152_T1_2mm T1_head_2mm -cost ls -skullstrip mniMask.nii.gz ./out/T1ls_2mm_mask
 ```
 
 The `T1_head_2mm` least-squares test is the fastest; use it for rapid iteration. The larger tests are slow.
@@ -53,18 +54,18 @@ The `T1_head_2mm` least-squares test is the fastest; use it for rapid iteration.
 
 Four source files, no internal build system:
 
-- **allineate.c** (~3700 lines) — Core registration engine: BLOK-based local correlation (TOHD), cost functions (Hellinger, Pearson, lpc, lpa), coarse-to-fine twopass optimization, affine warp + interpolation (NN/trilinear/tricubic). Uses OpenMP with thread-local workspace buffers. Compile with `-DAL_PROFILE` for per-stage timing breakdown.
-- **allineate.h** — Public API: `nii_allineate()` (register), `nii_deface()` (anonymize), `al_opts` struct, CLI argument parsing helpers.
+- **allineate.c** (~3800 lines) — Core registration engine: BLOK-based local correlation (TOHD), cost functions (Hellinger, Pearson, lpc, lpa), coarse-to-fine twopass optimization, affine warp + interpolation (NN/trilinear/tricubic). Uses OpenMP with thread-local workspace buffers. Compile with `-DAL_PROFILE` for per-stage timing breakdown.
+- **allineate.h** — Public API: `nii_allineate()` (register), `nii_deface()` (deface/skullstrip), `al_opts` struct, CLI argument parsing helpers.
 - **nifti_io.c/h** (~2100 lines) — NIfTI-1/NIfTI-2/Analyze 7.5 reader/writer, gzip/zstd support, mat44 math, quaternion↔affine conversions.
 - **powell_newuoa.c** (~2400 lines) — Powell's NEWUOA derivative-free optimizer (f2c translation). Used for the non-smooth cost function minimization.
-- **main.c** — CLI entry point. Parses `<moving> <stationary> [opts] <output>`, calls `nii_allineate()`, writes gzipped NIfTI output.
+- **main.c** — CLI entry point. Parses `<moving> <stationary> [opts] <output>`, calls `nii_allineate()` or `nii_deface()` (via `-skullstrip`), writes gzipped NIfTI output.
 
 ## Key Design Details
 
 - Cost functions: `ls` (Pearson, fast, same-modality), `hel` (Hellinger, default, cross-modal), `lpc`/`lpa` (local Pearson, cross-modal, use with `-source_automask`). Compile with `-DAL_LPC_MICHO` for lpc+ZZ combined cost variant.
 - Optimization: twopass coarse→fine via Powell/NEWUOA; optional center-of-mass (`-cmass`) initialization. Coarse pass downsamples the source image 2x for the grid search (better cache coherency), then restores full resolution for refinement. Grid search, candidate refinement, and refinement rounds are all parallelized via OpenMP. Fine pass parallelizes candidate evaluation across threads, then runs a final sequential Powell optimization.
 - Sparse sampling (matching AFNI): when the source has fewer voxels than the base mask (`nvox_src < nmask`), the fine-pass matching point count is scaled by `ntask = sqrt(nvox_source * nmask)` then sampled at 47%. When `nvox_src >= nmask`, `ntask = nmask` (no scaling). This avoids redundant oversampling for cross-resolution registration (e.g., 2.4mm fMRI to 1mm T1). Compile with `-DAL_MATCH_ALL` to use all mask points instead (slower, marginally more precise for same-resolution images).
-- `-interp` controls fine-pass interpolation (default: linear, matching AFNI). `-final` controls output interpolation (default: cubic, matching AFNI). Use `-final linear` for faster output with slight blurring, or `-final NN` for integer-valued data (e.g. atlases). The `-nearest`/`-linear`/`-cubic` flags are shortcuts for `-final`.
+- `-interp` controls fine-pass interpolation (default: linear, matching AFNI). `-final` controls output interpolation; default is mode-dependent (`AL_INTERP_DEFAULT`): cubic for registration, linear for `-skullstrip` (to avoid mask ringing). Use `-final linear` for faster output with slight blurring, or `-final NN` for integer-valued data (e.g. atlases). The `-nearest`/`-linear`/`-cubic` flags are shortcuts for `-final`.
 - Tricubic warp uses an interior/border split: scanlines are divided into a bounds-checked border region and a fast interior path that skips all CLIP/floorf overhead.
 - The source image is modified in-place during registration (data replaced, dims updated to match base grid)
-- `nii_deface` registers template→input then warps a mask to zero facial voxels in native space
+- `-skullstrip <brainmask>`: registers the moving template to the stationary image, warps the brain mask to stationary space, and sets non-brain voxels (warped mask < 0.5) to the image's minimum value. Non-float32 inputs are automatically converted. Implemented via `nii_deface()`, which handles both skullstripping and defacing (same register-and-mask mechanism).

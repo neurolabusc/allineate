@@ -48,6 +48,8 @@ int show_help( void ) {
 	printf("                               -interp does NOT affect the output image (use -final).\n");
 	printf("                       -final XX  (NN,linear,cubic) output interpolation [default: cubic]\n");
 	printf("                       -nearest -linear -cubic (shortcuts for -final)\n");
+	printf("                       -skullstrip XX  brain mask in moving space; output = stationary\n");
+	printf("                                 with non-brain voxels set to darkest value [default final: linear]\n");
 	printf("                       default cost: Hellinger; use -source_automask with lpc/lpa\n");
 	return 0;
 }
@@ -96,20 +98,48 @@ int main(int argc, char * argv[]) {
 		nifti_image_free(moving);
 		goto cleanup;
 	}
-	int ret = nii_allineate(moving, stationary, opts);
-	nifti_image_free(stationary);
-	if (ret) {
-		fprintf(stderr, "Registration failed\n");
+	if (opts.skullstrip) {
+		/* Skullstrip mode: register moving (template) to stationary, warp
+		   brain mask, zero non-brain voxels. Output is the stationary image. */
+		nifti_image *mask = nifti_image_read(opts.skullstrip, 1);
+		if (!mask) {
+			fprintf(stderr, "Failed to read brain mask '%s'\n", opts.skullstrip);
+			nifti_image_free(moving);
+			nifti_image_free(stationary);
+			goto cleanup;
+		}
+		int ret = nii_deface(stationary, moving, mask, opts);
+		nifti_image_free(mask);
 		nifti_image_free(moving);
-		goto cleanup;
-	}
-	if (nifti_set_filenames(moving, output_name, 0, 0)) {
-		fprintf(stderr, "Failed to set output filename '%s'\n", output_name);
+		if (ret) {
+			fprintf(stderr, "Skullstrip failed\n");
+			nifti_image_free(stationary);
+			goto cleanup;
+		}
+		if (nifti_set_filenames(stationary, output_name, 0, 0)) {
+			fprintf(stderr, "Failed to set output filename '%s'\n", output_name);
+			nifti_image_free(stationary);
+			goto cleanup;
+		}
+		nifti_image_write(stationary);
+		nifti_image_free(stationary);
+	} else {
+		/* Normal registration mode */
+		int ret = nii_allineate(moving, stationary, opts);
+		nifti_image_free(stationary);
+		if (ret) {
+			fprintf(stderr, "Registration failed\n");
+			nifti_image_free(moving);
+			goto cleanup;
+		}
+		if (nifti_set_filenames(moving, output_name, 0, 0)) {
+			fprintf(stderr, "Failed to set output filename '%s'\n", output_name);
+			nifti_image_free(moving);
+			goto cleanup;
+		}
+		nifti_image_write(moving);
 		nifti_image_free(moving);
-		goto cleanup;
 	}
-	nifti_image_write(moving);
-	nifti_image_free(moving);
 	/* Verify the output was actually written (nifti_image_write returns void) */
 	FILE *fcheck = fopen(output_name, "rb");
 	if (fcheck) {

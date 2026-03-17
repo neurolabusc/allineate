@@ -22,27 +22,30 @@
 #define AL_CMASS_YES      1  /* Use center-of-mass for initial shift */
 
 /* Interpolation codes (shared between -interp and -final) */
-#define AL_INTERP_CODE_NN       0  /* Nearest-neighbor */
-#define AL_INTERP_CODE_LINEAR   1  /* Trilinear (default for -interp, matching AFNI) */
-#define AL_INTERP_CODE_CUBIC    3  /* Tricubic */
+#define AL_INTERP_NN       0  /* Nearest-neighbor */
+#define AL_INTERP_LINEAR   1  /* Trilinear (default for -interp, matching AFNI) */
+#define AL_INTERP_CUBIC    3  /* Tricubic */
+#define AL_INTERP_DEFAULT -1  /* Use mode-appropriate default (cubic for allineate, linear for deface) */
 
 /* Options for nii_allineate and nii_deface */
 typedef struct {
     int cost;              /* AL_COST_* code (default: AL_COST_HELLINGER) */
     int cmass;             /* AL_CMASS_* code (default: AL_CMASS_NONE) */
     int source_automask;   /* if nonzero, fill outside of source automask with noise */
-    int interp;            /* AL_INTERP_CODE_* for fine-pass matching (default: LINEAR) */
-    int final_interp;      /* AL_INTERP_CODE_* for output reslicing (default: CUBIC) */
+    int interp;            /* AL_INTERP_* for fine-pass matching (default: LINEAR) */
+    int final_interp;      /* AL_INTERP_* for output reslicing (default: AL_INTERP_DEFAULT) */
+    const char *skullstrip; /* brain mask file for -skullstrip mode (NULL = normal registration) */
 } al_opts;
 
-/* Initialize options to defaults (-interp defaults to linear, -final to cubic) */
+/* Initialize options to defaults */
 static inline al_opts al_opts_default(void) {
     al_opts o;
     o.cost = AL_COST_HELLINGER;
     o.cmass = AL_CMASS_NONE;
     o.source_automask = 0;
-    o.interp = AL_INTERP_CODE_LINEAR;
-    o.final_interp = AL_INTERP_CODE_CUBIC;
+    o.interp = AL_INTERP_LINEAR;
+    o.final_interp = AL_INTERP_DEFAULT;
+    o.skullstrip = NULL;
     return o;
 }
 
@@ -56,16 +59,16 @@ static inline int al_parse_cost(const char *name, int *cost_out) {
     return 1;
 }
 
-/* Parse interpolation name string into AL_INTERP_CODE_* code.
+/* Parse interpolation name string into AL_INTERP_* code.
    Returns 0 on success, 1 on unrecognized name. */
 static inline int al_parse_interp(const char *name, int *code_out) {
     if (!strcmp(name, "NN") || !strcmp(name, "nearest") ||
         !strcmp(name, "nearestneighbour") || !strcmp(name, "nearestneighbor"))
-        { *code_out = AL_INTERP_CODE_NN; return 0; }
+        { *code_out = AL_INTERP_NN; return 0; }
     if (!strcmp(name, "linear") || !strcmp(name, "trilinear"))
-        { *code_out = AL_INTERP_CODE_LINEAR; return 0; }
+        { *code_out = AL_INTERP_LINEAR; return 0; }
     if (!strcmp(name, "cubic") || !strcmp(name, "tricubic"))
-        { *code_out = AL_INTERP_CODE_CUBIC; return 0; }
+        { *code_out = AL_INTERP_CUBIC; return 0; }
     return 1;
 }
 
@@ -83,11 +86,18 @@ static inline int al_parse_subopts(int *ac, int argc, char **argv, al_opts *opts
         } else if (!strcmp(argv[*ac], "-source_automask")) {
             opts->source_automask = 1;
         } else if (!strcmp(argv[*ac], "-nearest") || !strcmp(argv[*ac], "-NN")) {
-            opts->final_interp = AL_INTERP_CODE_NN;
+            opts->final_interp = AL_INTERP_NN;
         } else if (!strcmp(argv[*ac], "-linear") || !strcmp(argv[*ac], "-trilinear")) {
-            opts->final_interp = AL_INTERP_CODE_LINEAR;
+            opts->final_interp = AL_INTERP_LINEAR;
         } else if (!strcmp(argv[*ac], "-cubic") || !strcmp(argv[*ac], "-tricubic")) {
-            opts->final_interp = AL_INTERP_CODE_CUBIC;
+            opts->final_interp = AL_INTERP_CUBIC;
+        } else if (!strcmp(argv[*ac], "-skullstrip")) {
+            (*ac)++;
+            if (*ac >= argc) {
+                fprintf(stderr, "%s -skullstrip requires a brain mask filename\n", cmd_name);
+                return 1;
+            }
+            opts->skullstrip = argv[*ac];
         } else if (!strcmp(argv[*ac], "-interp")) {
             (*ac)++;
             if (*ac >= argc) {
@@ -131,14 +141,17 @@ static inline int al_parse_subopts(int *ac, int argc, char **argv, al_opts *opts
    source: the moving image (will be modified in-place: data replaced, dims updated)
    base: the stationary/reference image
    opts: registration options (cost function, cmass, interpolation, etc.)
+   final_interp default: cubic.
    Returns 0 on success, nonzero on error. */
 int nii_allineate(nifti_image *source, nifti_image *base, al_opts opts);
 
-/* Deface: register template to input, warp mask to input space, zero masked voxels.
-   input: the image to deface (modified in-place, stays in its own space)
+/* Deface/skullstrip: register template to input, warp mask to input space,
+   set voxels where warped mask < 0.5 to the input's minimum value.
+   input: the image to modify (modified in-place, stays in its own space)
    tmpl: template image (moving image for registration)
-   mask: mask in template space (non-zero = keep, zero = remove face)
+   mask: mask in template space (non-zero = keep)
    opts: registration options (cost function, cmass)
+   final_interp default: linear (to avoid ringing in the mask).
    Returns 0 on success, nonzero on error. */
 int nii_deface(nifti_image *input, nifti_image *tmpl, nifti_image *mask, al_opts opts);
 
