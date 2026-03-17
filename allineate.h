@@ -21,6 +21,12 @@
 #define AL_CMASS_NONE     0  /* No center-of-mass alignment */
 #define AL_CMASS_YES      1  /* Use center-of-mass for initial shift */
 
+/* Warp type codes (number of free parameters) */
+#define AL_WARP_SHIFT_ONLY          3  /* shift_only / sho: 3 DOF */
+#define AL_WARP_SHIFT_ROTATE        6  /* shift_rotate / shr: 6 DOF */
+#define AL_WARP_SHIFT_ROTATE_SCALE  9  /* shift_rotate_scale / srs: 9 DOF */
+#define AL_WARP_AFFINE_GENERAL     12  /* affine_general / aff: 12 DOF (default) */
+
 /* Interpolation codes (shared between -interp and -final) */
 #define AL_INTERP_NN       0  /* Nearest-neighbor */
 #define AL_INTERP_LINEAR   1  /* Trilinear (default for -interp, matching AFNI) */
@@ -34,6 +40,7 @@ typedef struct {
     int source_automask;   /* if nonzero, fill outside of source automask with noise */
     int interp;            /* AL_INTERP_* for fine-pass matching (default: LINEAR) */
     int final_interp;      /* AL_INTERP_* for output reslicing (default: AL_INTERP_DEFAULT) */
+    int warp;              /* AL_WARP_* DOF count (default: AL_WARP_AFFINE_GENERAL = 12) */
     const char *skullstrip; /* brain mask file for -skullstrip mode (NULL = normal registration) */
 } al_opts;
 
@@ -45,6 +52,7 @@ static inline al_opts al_opts_default(void) {
     o.source_automask = 0;
     o.interp = AL_INTERP_LINEAR;
     o.final_interp = AL_INTERP_DEFAULT;
+    o.warp = AL_WARP_AFFINE_GENERAL;
     o.skullstrip = NULL;
     return o;
 }
@@ -70,6 +78,30 @@ static inline int al_parse_interp(const char *name, int *code_out) {
     if (!strcmp(name, "cubic") || !strcmp(name, "tricubic"))
         { *code_out = AL_INTERP_CUBIC; return 0; }
     return 1;
+}
+
+/* Parse warp type name into AL_WARP_* code.
+   Returns 0 on success, 1 on unrecognized name. */
+static inline int al_parse_warp(const char *name, int *warp_out) {
+    if (!strcmp(name, "shift_only") || !strcmp(name, "sho"))
+        { *warp_out = AL_WARP_SHIFT_ONLY; return 0; }
+    if (!strcmp(name, "shift_rotate") || !strcmp(name, "shr"))
+        { *warp_out = AL_WARP_SHIFT_ROTATE; return 0; }
+    if (!strcmp(name, "shift_rotate_scale") || !strcmp(name, "srs"))
+        { *warp_out = AL_WARP_SHIFT_ROTATE_SCALE; return 0; }
+    if (!strcmp(name, "affine_general") || !strcmp(name, "aff"))
+        { *warp_out = AL_WARP_AFFINE_GENERAL; return 0; }
+    return 1;
+}
+
+/* Return human-readable name for an AL_WARP_* code. */
+static inline const char *al_warp_name(int warp) {
+    switch (warp) {
+        case AL_WARP_SHIFT_ONLY:         return "shift_only";
+        case AL_WARP_SHIFT_ROTATE:       return "shift_rotate";
+        case AL_WARP_SHIFT_ROTATE_SCALE: return "shift_rotate_scale";
+        default:                         return "affine_general";
+    }
 }
 
 /* Parse sub-arguments from argv.
@@ -98,6 +130,16 @@ static inline int al_parse_subopts(int *ac, int argc, char **argv, al_opts *opts
                 return 1;
             }
             opts->skullstrip = argv[*ac];
+        } else if (!strcmp(argv[*ac], "-warp")) {
+            (*ac)++;
+            if (*ac >= argc) {
+                fprintf(stderr, "%s -warp requires a type (sho, shr, srs, aff)\n", cmd_name);
+                return 1;
+            }
+            if (al_parse_warp(argv[*ac], &opts->warp)) {
+                fprintf(stderr, "Unknown warp '%s' (use: sho, shr, srs, aff)\n", argv[*ac]);
+                return 1;
+            }
         } else if (!strcmp(argv[*ac], "-interp")) {
             (*ac)++;
             if (*ac >= argc) {

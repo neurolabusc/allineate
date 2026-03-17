@@ -2774,11 +2774,24 @@ static float *al_autoweight(float *basim, int nx, int ny, int nz,
         for (ii = 0; ii < nx; ii++)
             for (ff = 0; ff < yfade; ff++) WV(ii, ff, kk) = WV(ii, ny - 1 - ff, kk) = 0.0f;
 
-    /* Squash large values */
-    mx = 0.0f;
-    for (ii = 0; ii < nxyz; ii++) if (wf[ii] > mx) mx = wf[ii];
-    clip = 0.5f * mx;
-    for (ii = 0; ii < nxyz; ii++) if (wf[ii] > clip) wf[ii] = clip;
+    /* Squash large values: clip at 3× median of nonzero voxels (matching AFNI) */
+    {
+        int npos = 0;
+        for (ii = 0; ii < nxyz; ii++) if (wf[ii] > 0.0f) npos++;
+        if (npos > 0) {
+            float *tmp = (float *)malloc(sizeof(float) * npos);
+            if (tmp) {
+                int tt = 0;
+                for (ii = 0; ii < nxyz; ii++) if (wf[ii] > 0.0f) tmp[tt++] = wf[ii];
+                /* Partial sort to find median */
+                qsort(tmp, npos, sizeof(float), al_float_cmp);
+                float median = tmp[npos / 2];
+                free(tmp);
+                clip = 3.0f * median;
+                for (ii = 0; ii < nxyz; ii++) if (wf[ii] > clip) wf[ii] = clip;
+            }
+        }
+    }
 
     /* Gaussian blur */
     sigma = 2.25f * (dx + dy + dz) / 3.0f;
@@ -3004,7 +3017,7 @@ static float param_dist(GA_setup *stup, float *p1, float *p2)
    Returns 0 on success, nonzero on error. */
 static int al_register(nifti_image *source, nifti_image *base,
                        int match_code, int do_cmass, int do_src_automask,
-                       int fine_interp_code, float wpar_out[12])
+                       int fine_interp_code, int warp_dof, float wpar_out[12])
 {
     GA_setup stup;
     GA_param params[12];
@@ -3358,9 +3371,13 @@ static int al_register(nifti_image *source, nifti_image *base,
 
     al_scalar_setup(&stup);
 
+    /* Permanently fix params beyond warp DOF (fixed=2 survives unfreeze) */
+    int nparam_free = warp_dof;
+    for (jj = nparam_free; jj < 12; jj++)
+        params[jj].fixed = 2;
+
     /* Temporarily freeze params beyond first 6 for coarse search */
-    int nparam_free = 12;
-    int nptwo = 6;
+    int nptwo = (nparam_free < 6) ? nparam_free : 6;
     if (nparam_free > nptwo) {
         for (ii = jj = 0; jj < stup.wfunc_numpar; jj++) {
             if (!stup.wfunc_param[jj].fixed) {
@@ -3672,12 +3689,12 @@ int nii_allineate(nifti_image *source, nifti_image *base, al_opts opts)
     int match_code;
     const char *cost_name;
     al_resolve_cost(opts.cost, &match_code, &cost_name);
-    fprintf(stderr, " + Cost function: %s, cmass: %s\n", cost_name,
-            opts.cmass ? "yes" : "no");
+    fprintf(stderr, " + Cost function: %s, cmass: %s, warp: %s (%d DOF)\n", cost_name,
+            opts.cmass ? "yes" : "no", al_warp_name(opts.warp), opts.warp);
 
     float wpar[12];
     int ok = al_register(source, base, match_code, opts.cmass,
-                         opts.source_automask, opts.interp, wpar);
+                         opts.source_automask, opts.interp, opts.warp, wpar);
     if (ok) return ok;
 
     /* Extract source float data for warping */
@@ -3767,7 +3784,7 @@ int nii_deface(nifti_image *input, nifti_image *tmpl, nifti_image *mask, al_opts
         free(input->data);
         input->data = fdata;
         input->datatype = DT_FLOAT32;
-        input->nbyper = 4;
+        input->nbyper = sizeof(float);
         input->scl_slope = 0.0f;
         input->scl_inter = 0.0f;
     }
@@ -3779,7 +3796,7 @@ int nii_deface(nifti_image *input, nifti_image *tmpl, nifti_image *mask, al_opts
 
     /* Register template (moving) to input (fixed) */
     float wpar[12];
-    int ok = al_register(tmpl, input, match_code, opts.cmass, 0, opts.interp, wpar);
+    int ok = al_register(tmpl, input, match_code, opts.cmass, 0, opts.interp, opts.warp, wpar);
     if (ok) {
         fprintf(stderr, "%s: registration failed\n", label);
         return 1;

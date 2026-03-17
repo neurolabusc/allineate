@@ -48,6 +48,8 @@ int show_help( void ) {
 	printf("                               -interp does NOT affect the output image (use -final).\n");
 	printf("                       -final XX  (NN,linear,cubic) output interpolation [default: cubic]\n");
 	printf("                       -nearest -linear -cubic (shortcuts for -final)\n");
+	printf("                       -warp XX (sho,shr,srs,aff) transform type [default: aff]\n");
+	printf("                         sho=shift(3), shr=shift+rotate(6), srs=+scale(9), aff=+shear(12)\n");
 	printf("                       -skullstrip XX  brain mask in moving space; output = stationary\n");
 	printf("                                 with non-brain voxels set to darkest value [default final: linear]\n");
 	printf("                       default cost: Hellinger; use -source_automask with lpc/lpa\n");

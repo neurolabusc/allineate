@@ -8,6 +8,7 @@ This is a minimal implementation of the AFNI [3dAllineate](https://afni.nimh.nih
  - AFNI suggests `-source_automask` for the lpc and lpa cost functions.
  - The `-cmass` argument uses the center of mass of the image to start a search. This can aid situations where the input image has a very different origin than the template, though it can hurt if the image includes excess neck and shoulders.
  - The `-skullstrip` option warps a brain mask from moving space to stationary space, then sets non-brain voxels to the darkest value in the stationary image.
+ - The `-warp` option limits the transform degrees of freedom: `sho` (shift, 3 DOF), `shr` (shift+rotate, 6), `srs` (+scale, 9), `aff` (full affine, 12, default). Fewer DOF means faster optimization.
 
 ```bash
 export OMP_NUM_THREADS=10
@@ -22,6 +23,7 @@ allineate T1_head MNI152_T1_1mm -cmass ./out/wT1cmas
 allineate fmri T1_head -cmass -cost lpc -source_automask ./out/fmri2t1
 3dAllineate -base ./T1_head.nii.gz  -input ./fmri.nii.gz  -prefix ./afni/fmri2t1.nii.gz -cmass  -cost lpc -source_automask 
 allineate MNI152_T1_2mm T1_head_2mm -cost ls -skullstrip mniMask.nii.gz ./out/T1ls_2mm_mask
+allineate MNI152_T1_2mmEXT T1_head -cost ls -skullstrip MNI152_T1_2mmEXT_mask.nii.gz ./out/T1ls_ext
 ```
 
 Benchmark on Apple M4 Max, compiled with Apple Clang 17 + libomp.

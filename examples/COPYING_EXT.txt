@@ -1,0 +1,26 @@
+Original images from
+  https://nist.mni.mcgill.ca/icbm-152-extended-nonlinear-atlases-2020/
+We want to remove facial features, but be aware that the linear normalization will not precisely match the shape of the brain. In addition, we often want a slightly larger area to allow good intensity normalization. Here is a method to dilate by 8mm
+
+1. Use nimath Euclidean Distance Function to dilate the brain mask by 12mm
+
+niimath mni_icbm152_t1_tal_nlin_asym_55_ext_mask.nii -binv -edt -thr 12 -thr 0 -binv emask12
+
+2. We are just trying to get the mask in the right ballpark, so we can downsample by a factor of 2
+
+python subsamp2.py mni_icbm152_t1_tal_nlin_asym_55_ext.nii MNI152_T1_2mm_ext.nii
+python subsamp2.py emask12.nii.gz MNI152_T1_2mm_ext_mask12.nii
+
+The license is unchanged:
+
+Copyright (C) 1993-2020 Louis Collins, McConnell Brain
+Imaging Centre, Montreal Neurological Institute, McGill University.
+Permission to use, copy, modify, and distribute this software and
+its documentation for any purpose and without fee is hereby granted,
+provided that the above copyright notice appear in all copies.  The
+authors and McGill University make no representations about the
+suitability of this software for any purpose.  It is provided "as
+is" without express or implied warranty.  The authors are not
+responsible for any data loss, equipment damage, property loss, or
+injury to subjects or patients resulting from the use or misuse of
+this software package. 
