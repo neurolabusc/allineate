@@ -1,0 +1,17 @@
+# Executables
+allineate
+
+# Object files
+*.o
+*.obj
+
+# macOS
+.DS_Store
+
+# Editor/IDE
+*.swp
+*.swo
+*~
+
+# Output files
+examples/out/
