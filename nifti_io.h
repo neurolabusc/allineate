@@ -451,6 +451,7 @@ typedef struct {
 /* I/O */
 nifti_image *nifti_image_read(const char *hname, int read_data);
 void         nifti_image_write(nifti_image *nim);
+int          nifti_image_write_status(nifti_image *nim);
 void         nifti_image_free(nifti_image *nim);
 void         nifti_image_infodump(const nifti_image *nim);
 

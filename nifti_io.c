@@ -47,6 +47,12 @@ typedef struct {
 #ifdef HAVE_ZSTD
    char  *zst_fname;    /* target filename for zstd write (deferred compression) */
 #endif
+   /* In-memory stream: for piped stdin, the whole (decompressed) input is slurped
+      into a shared buffer so the stream is fully seekable. mbuf points at the
+      shared g_stdin_buf (not owned/freed by this handle); mpos is per-handle. */
+   unsigned char *mbuf;
+   int64_t mlen;
+   int64_t mpos;
 } *NIIFILE;
 
 #define ZNZ_MAX_BLOCK_SIZE (1<<30)
@@ -113,7 +119,7 @@ static FILE *zst_decompress_to_tmpfile(const char *path)
 
    FILE *tmpf = tmpfile();
    if (!tmpf) { free(dbuf); return NULL; }
-   fwrite(dbuf, 1, result, tmpf);
+   if (fwrite(dbuf, 1, result, tmpf) != result) { free(dbuf); fclose(tmpf); return NULL; }
    free(dbuf);
    rewind(tmpf);
    return tmpf;
@@ -144,12 +150,120 @@ static int zst_compress_from_tmpfile(FILE *tmpf, const char *path)
 
    FILE *fout = fopen(path, "wb");
    if (!fout) { free(cbuf); return -1; }
-   fwrite(cbuf, 1, csize, fout);
-   fclose(fout);
+   size_t nw = fwrite(cbuf, 1, csize, fout);
+   int cerr = fclose(fout);
    free(cbuf);
+   if (nw != csize || cerr) {
+      fprintf(stderr, "** zstd write error to '%s'\n", path);
+      return -1;
+   }
    return 0;
 }
 #endif /* HAVE_ZSTD */
+
+/* Shared decompressed contents of piped stdin. stdin can only be consumed once,
+   so it is slurped in full on first read and cached here; every nii_open("-","r")
+   then hands out a fresh seekable view over this buffer. Leaked at exit (CLI). */
+static unsigned char *g_stdin_buf = NULL;
+static int64_t        g_stdin_len = 0;
+
+/* Sanity cap on piped input (raw slurp and inflated size). Guards a runaway or
+   maliciously compressible stream (e.g. `cat /dev/zero |`) from exhausting RAM
+   before any header validation. Generous enough for real whole-brain volumes. */
+#define NII_STDIN_CAP_16G UINT64_C(17179869184)
+#if SIZE_MAX < NII_STDIN_CAP_16G
+#define NII_STDIN_MAX SIZE_MAX
+#else
+#define NII_STDIN_MAX ((size_t)NII_STDIN_CAP_16G)
+#endif
+
+/* Read all of stdin into a malloc'd buffer. Returns bytes read (>=0), or -1 on
+   error/over-cap; *out receives the buffer (caller frees). */
+static int64_t slurp_all_stdin(unsigned char **out)
+{
+   size_t cap = 1 << 20, len = 0;
+   unsigned char *buf = (unsigned char *)malloc(cap);
+   if (!buf) return -1;
+   for (;;) {
+      if (len == cap) {
+         if (cap >= NII_STDIN_MAX || cap > SIZE_MAX / 2) {
+            fprintf(stderr, "** piped input exceeds %zu-byte cap\n", NII_STDIN_MAX);
+            free(buf); return -1;
+         }
+         size_t ncap = cap * 2;
+         if (ncap > NII_STDIN_MAX) ncap = NII_STDIN_MAX;
+         unsigned char *nb = (unsigned char *)realloc(buf, ncap);
+         if (!nb) { free(buf); return -1; }
+         buf = nb; cap = ncap;
+      }
+      size_t got = fread(buf + len, 1, cap - len, stdin);
+      len += got;
+      if (got == 0) break;   /* EOF or error */
+   }
+   if (ferror(stdin)) { free(buf); return -1; }
+   *out = buf;
+   return (int64_t)len;
+}
+
+/* Populate g_stdin_buf/g_stdin_len once: slurp stdin, and if it is gzip
+   (magic 1f 8b) transparently inflate it. Returns 0 on success, -1 on error. */
+static int ensure_stdin_slurped(void)
+{
+   if (g_stdin_buf) return 0;
+   unsigned char *raw = NULL;
+   int64_t rawlen = slurp_all_stdin(&raw);
+   if (rawlen < 0) return -1;
+   int is_gz = (rawlen >= 2 && raw[0] == 0x1f && raw[1] == 0x8b);
+   if (!is_gz) { g_stdin_buf = raw; g_stdin_len = rawlen; return 0; }
+#ifdef HAVE_ZLIB
+   z_stream s; memset(&s, 0, sizeof(s));
+   if (inflateInit2(&s, 16 + MAX_WBITS) != Z_OK) { free(raw); return -1; }
+   size_t rawsz = (size_t)rawlen;
+   size_t cap = (rawsz > (NII_STDIN_MAX - (1 << 20)) / 4)
+              ? NII_STDIN_MAX : rawsz * 4 + (1 << 20);
+   if (cap < (1 << 20)) cap = 1 << 20;
+   size_t len = 0;      /* decompressed bytes produced so far */
+   size_t in_off = 0;   /* compressed bytes consumed so far */
+   unsigned char *out = (unsigned char *)malloc(cap);
+   if (!out) { inflateEnd(&s); free(raw); return -1; }
+   /* zlib's avail_in/avail_out are 32-bit uInt, so feed input and output in
+      <=1 GiB chunks and advance the 64-bit offsets by what each call consumed/
+      produced (never trust (uInt)len64 casts, which truncate above 4 GiB). */
+   const uInt ZCHUNK = 1u << 30;
+   int zret;
+   do {
+      if (len == cap) {
+         if (cap >= NII_STDIN_MAX || cap > SIZE_MAX / 2) {
+            fprintf(stderr, "** piped gzip inflates beyond %zu-byte cap\n", NII_STDIN_MAX);
+            free(out); inflateEnd(&s); free(raw); return -1;
+         }
+         size_t ncap = cap * 2;
+         if (ncap > NII_STDIN_MAX) ncap = NII_STDIN_MAX;
+         unsigned char *nb = (unsigned char *)realloc(out, ncap);
+         if (!nb) { free(out); inflateEnd(&s); free(raw); return -1; }
+         out = nb; cap = ncap;
+      }
+      size_t in_remain = rawsz - in_off, out_remain = cap - len;
+      s.next_in  = raw + in_off;
+      s.avail_in = (in_remain > ZCHUNK) ? ZCHUNK : (uInt)in_remain;
+      s.next_out = out + len;
+      s.avail_out = (out_remain > ZCHUNK) ? ZCHUNK : (uInt)out_remain;
+      uInt in0 = s.avail_in, out0 = s.avail_out;
+      zret = inflate(&s, Z_NO_FLUSH);
+      in_off += (in0 - s.avail_in);
+      len    += (out0 - s.avail_out);
+      if (zret != Z_OK && zret != Z_STREAM_END) { free(out); inflateEnd(&s); free(raw); return -1; }
+   } while (zret != Z_STREAM_END);
+   inflateEnd(&s);
+   free(raw);
+   g_stdin_buf = out; g_stdin_len = (int64_t)len;
+   return 0;
+#else
+   free(raw);
+   fprintf(stderr, "** piped gzip input requires zlib support\n");
+   return -1;
+#endif
+}
 
 static NIIFILE nii_open(const char *path, const char *mode, int use_gz)
 {
@@ -158,8 +272,13 @@ static NIIFILE nii_open(const char *path, const char *mode, int use_gz)
 
    /* stdout/stdin special case */
    if (strcmp(path, "-") == 0) {
-      if (mode[0] == 'r') f->nzfptr = stdin;
-      else                 f->nzfptr = stdout;
+      if (mode[0] == 'r') {
+         /* Slurp+decompress stdin once; hand out a seekable view of the buffer. */
+         if (ensure_stdin_slurped()) { free(f); return NULL; }
+         f->mbuf = g_stdin_buf; f->mlen = g_stdin_len; f->mpos = 0;
+      } else {
+         f->nzfptr = stdout;
+      }
       return f;
    }
 
@@ -173,7 +292,10 @@ static NIIFILE nii_open(const char *path, const char *mode, int use_gz)
          /* Deferred write: buffer to tmpfile, compress on close */
          f->zst_fname = nifti_strdup(path);
          f->nzfptr = tmpfile();
-         if (!f->nzfptr || !f->zst_fname) { free(f->zst_fname); free(f); return NULL; }
+         if (!f->nzfptr || !f->zst_fname) {
+            if (f->nzfptr) fclose(f->nzfptr);   /* don't leak a created temp file */
+            free(f->zst_fname); free(f); return NULL;
+         }
       }
       return f;
    }
@@ -231,6 +353,15 @@ static int nii_close(NIIFILE *fp)
 static size_t nii_read(void *buf, size_t size, size_t nmemb, NIIFILE f)
 {
    if (!f) return 0;
+   if (f->mbuf) {
+      int64_t avail = f->mlen - f->mpos;
+      if (avail < 0) avail = 0;
+      uint64_t want = (uint64_t)size * nmemb;
+      uint64_t n = (want <= (uint64_t)avail) ? want : (uint64_t)avail;
+      memcpy(buf, f->mbuf + f->mpos, (size_t)n);
+      f->mpos += (int64_t)n;
+      return (size == 0) ? 0 : (size_t)(n / size);
+   }
 #ifdef HAVE_ZLIB
    if (f->zfptr) {
       size_t remain = size * nmemb;
@@ -270,46 +401,28 @@ static size_t nii_write(const void *buf, size_t size, size_t nmemb, NIIFILE f)
    return fwrite(buf, size, nmemb, f->nzfptr);
 }
 
-static long nii_seek(NIIFILE f, long offset, int whence)
+static long nii_seek(NIIFILE f, int64_t offset, int whence)
 {
    if (!f) return 0;
-#ifdef HAVE_ZLIB
-   if (f->zfptr) return (long)gzseek(f->zfptr, offset, whence);
-#endif
-   if (f->nzfptr == stdin) {
-      if (whence == SEEK_SET && offset > 0) {
-         long skipped = 0;
-         char buf[512];
-         while (skipped < offset) {
-            size_t to_read = (offset - skipped < (long)sizeof(buf)) ? (size_t)(offset - skipped) : sizeof(buf);
-            size_t bytes = fread(buf, 1, to_read, f->nzfptr);
-            if (bytes == 0) return -1;
-            skipped += bytes;
-         }
-         return 0;
-      }
-      return -1;
+   if (f->mbuf) {
+      int64_t base = (whence == SEEK_CUR) ? f->mpos : (whence == SEEK_END) ? f->mlen : 0;
+      int64_t np = base + offset;
+      if (np < 0) return -1;   /* seeking past end is allowed (reads then short) */
+      f->mpos = np;
+      return 0;
    }
-   return fseek(f->nzfptr, offset, whence);
-}
-
-static long nii_tell(NIIFILE f)
-{
-   if (!f) return 0;
 #ifdef HAVE_ZLIB
-   if (f->zfptr) return (long)gztell(f->zfptr);
+   if (f->zfptr) return (long)gzseek(f->zfptr, (z_off_t)offset, whence);
 #endif
-   return ftell(f->nzfptr);
-}
-
-static int nii_rewind(NIIFILE f)
-{
-   if (!f) return 0;
-#ifdef HAVE_ZLIB
-   if (f->zfptr) return (int)gzseek(f->zfptr, 0L, SEEK_SET);
+   /* 64-bit file seek: plain fseek takes a 32-bit long on LLP64 (Windows) and
+      would truncate offsets >2 GiB in large NIfTI-2 files. */
+#if defined(_WIN32)
+   return (long)_fseeki64(f->nzfptr, (long long)offset, whence);
+#elif defined(_LARGEFILE_SOURCE) || defined(__APPLE__) || defined(__linux__)
+   return (long)fseeko(f->nzfptr, (off_t)offset, whence);
+#else
+   return fseek(f->nzfptr, (long)offset, whence);
 #endif
-   rewind(f->nzfptr);
-   return 0;
 }
 
 /*========== Magic bytes ==========*/
@@ -344,20 +457,6 @@ int nifti_compiled_with_zlib(void)
 #endif
 }
 
-static int stdin_has_data(void)
-{
-#ifdef _WIN32
-   DWORD bytesAvailable = 0;
-   HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
-   if (hStdin == INVALID_HANDLE_VALUE) return 0;
-   if (!PeekNamedPipe(hStdin, NULL, 0, NULL, &bytesAvailable, NULL)) return 0;
-   return bytesAvailable > 0;
-#else
-   struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
-   int ret = poll(&pfd, 1, 0);
-   return (ret > 0 && (pfd.revents & POLLIN));
-#endif
-}
 
 static int64_t nifti_get_filesize(const char *pathname)
 {
@@ -1412,6 +1511,45 @@ static mat33 nifti_mat33_polar(mat33 A)
 
 /*========== Header ↔ nifti_image conversion ==========*/
 
+/* A 3x3 spatial block is usable if every value is finite, no column is zero, and
+   it is non-singular. Singularity is tested scale-invariantly: |det| normalized
+   by the product of the column norms is the volume of the unit-vector
+   parallelepiped (~1 orthogonal, ~0 collinear), so one fixed tolerance works at
+   any voxel size and tiny-scale grids are not wrongly rejected. */
+static int nifti_dmat44_spatial_ok(nifti_dmat44 m)
+{
+   for (int r = 0; r < 3; r++)
+      for (int c = 0; c < 3; c++)
+         if (!isfinite(m.m[r][c])) return 0;
+   double n[3];
+   for (int c = 0; c < 3; c++) {
+      n[c] = sqrt(m.m[0][c]*m.m[0][c] + m.m[1][c]*m.m[1][c] + m.m[2][c]*m.m[2][c]);
+      if (!(n[c] > 0.0) || !isfinite(n[c])) return 0;
+   }
+   double det = m.m[0][0]*(m.m[1][1]*m.m[2][2] - m.m[1][2]*m.m[2][1])
+              - m.m[0][1]*(m.m[1][0]*m.m[2][2] - m.m[1][2]*m.m[2][0])
+              + m.m[0][2]*(m.m[1][0]*m.m[2][1] - m.m[1][1]*m.m[2][0]);
+   return fabs(det) / (n[0]*n[1]*n[2]) > 1e-4;
+}
+
+/* After reading, fill a MISSING/INVALID sform from a valid qform. Several niimath
+   operators (e.g. -reslice) read sto_xyz directly instead of choosing the best
+   xform, so a qform-only image (sform_code == 0, common in FSL-preprocessed data)
+   would hand them a zero matrix. This fires ONLY when the sform is absent or
+   degenerate — a present, valid sform is left untouched, even if qform_code is
+   higher, so simply reading a file never rewrites intentional spatial metadata
+   (audit High #1). */
+static void nifti_sync_sform_from_qform(nifti_image *nim)
+{
+   int s_ok = nim->sform_code > 0 && nifti_dmat44_spatial_ok(nim->sto_xyz);
+   int q_ok = nim->qform_code > 0 && nifti_dmat44_spatial_ok(nim->qto_xyz);
+   if (q_ok && !s_ok) {
+      nim->sto_xyz = nim->qto_xyz;
+      nim->sto_ijk = nim->qto_ijk;
+      nim->sform_code = nim->qform_code;
+   }
+}
+
 static nifti_image *nifti_convert_n1hdr2nim(nifti_1_header nhdr, const char *fname)
 {
    int ii, doswap, ioff, ni_ver, is_onefile;
@@ -1528,6 +1666,7 @@ static nifti_image *nifti_convert_n1hdr2nim(nifti_1_header nhdr, const char *fna
       if (!nim->iname) { free(nim); return NULL; }
    }
    nim->num_ext = 0; nim->ext_list = NULL;
+   nifti_sync_sform_from_qform(nim);
    return nim;
 }
 
@@ -1633,6 +1772,7 @@ static nifti_image *nifti_convert_n2hdr2nim(nifti_2_header nhdr, const char *fna
       if (!nim->iname) { free(nim); return NULL; }
    }
    nim->num_ext = 0; nim->ext_list = NULL;
+   nifti_sync_sform_from_qform(nim);
    return nim;
 }
 
@@ -1851,9 +1991,10 @@ nifti_image *nifti_image_read(const char *hname, int read_data)
    }
 
    if (isStdIn) {
-      filesize = -1;
-      if (!stdin_has_data()) { fprintf(stderr, " unable to read piped input buffer\n"); return NULL; }
+      /* nii_open slurps stdin (decompressing gzip) into a seekable buffer. */
       fp = nii_open("-", "rb", 0);
+      if (!fp) { fprintf(stderr, " unable to read piped input buffer\n"); return NULL; }
+      filesize = g_stdin_len;   /* full (decompressed) size, seekable */
    } else {
       fp = nii_open(hfile, "rb", nifti_is_gzfile(hfile));
    }
@@ -1900,9 +2041,17 @@ nifti_image *nifti_image_read(const char *hname, int read_data)
    if (read_data) {
       if (isStdIn) {
          nim->iname = nifti_strdup("-");
-         if (ni_ver != 1) { fprintf(stderr, "piped input only supports NIFTI-1\n"); return NULL; }
+         if (ni_ver != 1) { fprintf(stderr, "piped input only supports NIFTI-1\n"); nifti_image_free(nim); return NULL; }
       }
-      /* load image data */
+      /* load image data. Guard the byte total against overflow BEFORE allocating:
+         a malformed header (huge nvox) would otherwise wrap nbyper*nvox and lead
+         to an under-allocated buffer that later ops (e.g. robustfov) overrun. */
+      if (nim->nbyper <= 0 || nim->nvox < 0 ||
+          nim->nvox > INT64_MAX / nim->nbyper ||
+          (uint64_t)(nim->nbyper * nim->nvox) > (uint64_t)SIZE_MAX) {
+         fprintf(stderr, "** ERROR: image byte count is out of range (corrupt header?)\n");
+         nifti_image_free(nim); return NULL;
+      }
       int64_t ntot = (int64_t)nim->nbyper * nim->nvox;
       NIIFILE dfp;
       if (isStdIn) {
@@ -1915,9 +2064,10 @@ nifti_image *nifti_image_read(const char *hname, int read_data)
       }
       if (!dfp) { nifti_image_free(nim); return NULL; }
 
+      /* The stdin buffer is fully seekable, so the data phase seeks to the
+         absolute iname_offset just like a regular file. */
       int64_t ioff = nim->iname_offset;
-      if (isStdIn) ioff -= sizeof(nifti_1_header);
-      if (nii_seek(dfp, (long)ioff, SEEK_SET) < 0) { nii_close(&dfp); nifti_image_free(nim); return NULL; }
+      if (nii_seek(dfp, ioff, SEEK_SET) < 0) { nii_close(&dfp); nifti_image_free(nim); return NULL; }
 
       if (!nim->data) {
          nim->data = calloc(1, ntot);
@@ -1969,6 +2119,13 @@ static int isStdOutFcn(nifti_image *nim)
 static int doPigz_write(nifti_image *nim, void *hdr, int hdrsize)
 {
    FILE *pigzPipe;
+   int rc;
+   /* The filename is interpolated into a shell command for popen(), so reject any
+      shell-dangerous character rather than risk command injection; returning -1
+      makes the caller fall back to the in-process gzip writer. (The real fix is to
+      drop the shell and use posix_spawn/exec — tracked for upstream niimath.) */
+   if (nim->fname == NULL || strpbrk(nim->fname, "\"'`$\\;|&<>()\n\r") != NULL)
+      return -1;
    size_t cmdlen = strlen(nim->fname) + 32;
    char *command = (char *)malloc(cmdlen);
    if (!command) return -1;
@@ -1981,28 +2138,70 @@ static int doPigz_write(nifti_image *nim, void *hdr, int hdrsize)
    free(command);
    if (!pigzPipe) return -1;
    /* Write header */
-   fwrite(hdr, 1, hdrsize, pigzPipe);
+   if (fwrite(hdr, 1, hdrsize, pigzPipe) != (size_t)hdrsize) {
+#ifdef _MSC_VER
+      _pclose(pigzPipe);
+#else
+      pclose(pigzPipe);
+#endif
+      return -1;
+   }
    /* Write extensions via wrapper */
    NIIFILE wfp = (NIIFILE)calloc(1, sizeof(*wfp));
-   if (!wfp) { pclose(pigzPipe); return -1; }
+   if (!wfp) {
+#ifdef _MSC_VER
+      _pclose(pigzPipe);
+#else
+      pclose(pigzPipe);
+#endif
+      return -1;
+   }
    wfp->nzfptr = pigzPipe;
-   if (nim->nifti_type != NIFTI_FTYPE_ANALYZE)
-      nifti_write_extensions(wfp, nim);
+   if (nim->nifti_type != NIFTI_FTYPE_ANALYZE &&
+       nifti_write_extensions(wfp, nim) < 0) {
+      free(wfp);
+#ifdef _MSC_VER
+      _pclose(pigzPipe);
+#else
+      pclose(pigzPipe);
+#endif
+      return -1;
+   }
    /* Write data */
-   if (nim->data)
-      fwrite(nim->data, 1, (size_t)nim->nbyper * nim->nvox, pigzPipe);
+   if (nim->data) {
+      if (nim->nbyper <= 0 || nim->nvox < 0 ||
+          (size_t)nim->nvox > SIZE_MAX / (size_t)nim->nbyper) {
+         free(wfp);
+#ifdef _MSC_VER
+         _pclose(pigzPipe);
+#else
+         pclose(pigzPipe);
+#endif
+         return -1;
+      }
+      size_t ntot = (size_t)nim->nbyper * (size_t)nim->nvox;
+      if (fwrite(nim->data, 1, ntot, pigzPipe) != ntot) {
+         free(wfp);
+#ifdef _MSC_VER
+         _pclose(pigzPipe);
+#else
+         pclose(pigzPipe);
+#endif
+         return -1;
+      }
+   }
    free(wfp);
 #ifdef _MSC_VER
-   _pclose(pigzPipe);
+   rc = _pclose(pigzPipe);
 #else
-   pclose(pigzPipe);
+   rc = pclose(pigzPipe);
 #endif
-   return 0;
+   return (rc == 0) ? 0 : -1;
 }
 #endif
 #endif
 
-void nifti_image_write(nifti_image *nim)
+int nifti_image_write_status(nifti_image *nim)
 {
    nifti_1_header n1hdr;
    nifti_2_header n2hdr;
@@ -2010,19 +2209,19 @@ void nifti_image_write(nifti_image *nim)
    int nver = 1;
    int hsize = (int)sizeof(nifti_1_header);
 
-   if (!nim || !nifti_validfilename(nim->fname)) return;
-   if (!nim->data) return;
+   if (!nim || !nifti_validfilename(nim->fname)) return 1;
+   if (!nim->data) return 1;
 
    int isStdOut = isStdOutFcn(nim);
 
    if (nim->nifti_type == NIFTI_FTYPE_NIFTI2_1 || nim->nifti_type == NIFTI_FTYPE_NIFTI2_2) {
       nifti_set_iname_offset(nim, 2);
-      if (nifti_convert_nim2n2hdr(nim, &n2hdr)) return;
+      if (nifti_convert_nim2n2hdr(nim, &n2hdr)) return 1;
       nver = 2;
       hsize = (int)sizeof(nifti_2_header);
    } else {
       nifti_set_iname_offset(nim, 1);
-      if (nifti_convert_nim2n1hdr(nim, &n1hdr)) return;
+      if (nifti_convert_nim2n1hdr(nim, &n1hdr)) return 1;
    }
 
    /* ensure iname is set for 2-file formats */
@@ -2030,7 +2229,7 @@ void nifti_image_write(nifti_image *nim)
       if (nim->iname && strcmp(nim->iname, nim->fname) == 0) { free(nim->iname); nim->iname = NULL; }
       if (!nim->iname) {
          nim->iname = nifti_makeimgname(nim->fname, nim->nifti_type, 0, 0);
-         if (!nim->iname) return;
+         if (!nim->iname) return 1;
       }
    }
 
@@ -2039,11 +2238,11 @@ void nifti_image_write(nifti_image *nim)
 #ifdef PIGZ
 #ifdef HAVE_ZLIB
       if ((nim->nifti_type == NIFTI_FTYPE_NIFTI1_1 || nim->nifti_type == NIFTI_FTYPE_NIFTI2_1)
-          && nifti_is_gzfile(nim->fname) == 1) {
+         && nifti_is_gzfile(nim->fname) == 1) {
          const char *val = getenv("AFNI_COMPRESSOR");
          if (val && strstr(val, "PIGZ")) {
             void *hdr = (nver == 2) ? (void *)&n2hdr : (void *)&n1hdr;
-            if (doPigz_write(nim, hdr, hsize) == 0) return;
+            if (doPigz_write(nim, hdr, hsize) == 0) return 0;
          }
       }
 #endif
@@ -2059,23 +2258,38 @@ void nifti_image_write(nifti_image *nim)
    } else {
       fp = nii_open(nim->fname, "wb", nifti_is_gzfile(nim->fname));
    }
-   if (!fp) return;
+   if (!fp) {
+      fprintf(stderr, "** ERROR: failed to open output '%s'\n", nim->fname ? nim->fname : "?");
+      return 1;
+   }
 
    /* write header */
    size_t ss;
    if (nver == 2) ss = nii_write(&n2hdr, 1, hsize, fp);
    else           ss = nii_write(&n1hdr, 1, hsize, fp);
-   if ((int)ss < hsize) { nii_close(&fp); return; }
+   if ((int)ss < hsize) {
+      fprintf(stderr, "** ERROR: failed to write NIfTI header to '%s'\n", nim->fname ? nim->fname : "?");
+      nii_close(&fp); return 1;
+   }
 
    /* write extensions */
-   if (nim->nifti_type != NIFTI_FTYPE_ANALYZE)
-      nifti_write_extensions(fp, nim);
+   if (nim->nifti_type != NIFTI_FTYPE_ANALYZE &&
+       nifti_write_extensions(fp, nim) < 0) {
+      fprintf(stderr, "** ERROR: failed to write NIfTI extensions to '%s'\n", nim->fname ? nim->fname : "?");
+      nii_close(&fp); return 1;
+   }
 
    /* for 2-file format, close header file and open image file */
    if (nim->nifti_type != NIFTI_FTYPE_NIFTI1_1 && nim->nifti_type != NIFTI_FTYPE_NIFTI2_1) {
-      nii_close(&fp);
+      if (nii_close(&fp)) {
+         fprintf(stderr, "** ERROR: failed to close NIfTI header '%s'\n", nim->fname ? nim->fname : "?");
+         return 1;
+      }
       fp = nii_open(nim->iname, "wb", nifti_is_gzfile(nim->iname));
-      if (!fp) return;
+      if (!fp) {
+         fprintf(stderr, "** ERROR: failed to open image output '%s'\n", nim->iname ? nim->iname : "?");
+         return 1;
+      }
    }
 
    /* seek/pad to data offset and write data */
@@ -2085,15 +2299,43 @@ void nifti_image_write(nifti_image *nim)
       int64_t pad = nim->iname_offset - written;
       if (pad > 0) {
          char zeros[16] = {0};
-         nii_write(zeros, 1, (size_t)pad, fp);
+         while (pad > 0) {
+            size_t chunk = (pad < (int64_t)sizeof(zeros)) ? (size_t)pad : sizeof(zeros);
+            if (nii_write(zeros, 1, chunk, fp) != chunk) {
+               fprintf(stderr, "** ERROR: failed to write NIfTI padding to stdout\n");
+               nii_close(&fp); return 1;
+            }
+            pad -= (int64_t)chunk;
+         }
       }
    } else {
-      nii_seek(fp, (long)nim->iname_offset, SEEK_SET);
+      if (nii_seek(fp, nim->iname_offset, SEEK_SET) < 0) {
+         fprintf(stderr, "** ERROR: failed to seek output '%s' to data offset\n", nim->fname ? nim->fname : "?");
+         nii_close(&fp); return 1;
+      }
+   }
+   if (nim->nbyper <= 0 || nim->nvox < 0 ||
+       nim->nvox > INT64_MAX / nim->nbyper ||
+       (uint64_t)(nim->nbyper * nim->nvox) > (uint64_t)SIZE_MAX) {
+      fprintf(stderr, "** ERROR: output image byte count is out of range\n");
+      nii_close(&fp); return 1;
    }
    int64_t ntot = (int64_t)nim->nbyper * nim->nvox;
-   nii_write(nim->data, 1, ntot, fp);
+   int64_t nwrote = (int64_t)nii_write(nim->data, 1, ntot, fp);
    nim->byteorder = nifti_short_order();
-   nii_close(&fp);
+   int cret = nii_close(&fp);
+   if (nwrote != ntot)
+      fprintf(stderr, "** ERROR: wrote %" PRId64 " of %" PRId64 " image bytes to '%s' (output may be truncated)\n",
+              nwrote, ntot, nim->fname ? nim->fname : "?");
+   else if (cret)
+      fprintf(stderr, "** ERROR: error closing output '%s' (output may be incomplete)\n",
+              nim->fname ? nim->fname : "?");
+   return (nwrote == ntot && cret == 0) ? 0 : 1;
+}
+
+void nifti_image_write(nifti_image *nim)
+{
+   (void)nifti_image_write_status(nim);
 }
 
 /*========== Free / infodump ==========*/

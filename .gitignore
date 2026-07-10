@@ -1,9 +1,17 @@
 # Executables
 allineate
+allineate.baseline
 
 # Object files
 *.o
 *.obj
+
+# Debug-symbol bundles (from `make sanitize`/`make debug`)
+*.dSYM/
+
+# Large local scratch data (not test fixtures — use `git add -f` to track intentionally)
+/MNI152_T1_0.5mm.nii.gz
+audit*.md
 
 # macOS
 .DS_Store
@@ -13,5 +21,9 @@ allineate
 *.swo
 *~
 
-# Output files
-examples/out/
+# Benchmark suite — kept local for now (some edge-case inputs contain
+# non-shareable facial information). Intend to add a shareable subset later.
+benchmark/
+
+# Python cache
+__pycache__/

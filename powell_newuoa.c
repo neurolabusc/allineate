@@ -10,6 +10,12 @@
 #include <float.h>
 #include <time.h>
 
+/* MSVC lacks POSIX srand48/drand48 */
+#ifdef _MSC_VER
+#define srand48(s) srand((unsigned int)(s))
+#define drand48()  ((double)rand() / (double)RAND_MAX)
+#endif
+
 /* Minimal f2c types */
 typedef long int integer;
 typedef double doublereal;
@@ -72,6 +78,24 @@ static PNL_TLOCAL int scalx = 0;
 static PNL_TLOCAL double *sxmin_arr = NULL; static PNL_TLOCAL int sxmin_arr_len = 0;
 static PNL_TLOCAL double *sxsiz_arr = NULL; static PNL_TLOCAL int sxsiz_arr_len = 0;
 static PNL_TLOCAL double *sx_arr = NULL; static PNL_TLOCAL int sx_arr_len = 0;
+static PNL_TLOCAL double *pn_con_x01 = NULL; static PNL_TLOCAL int pn_con_x01_len = 0;
+static PNL_TLOCAL double *pn_con_w = NULL; static PNL_TLOCAL int pn_con_w_len = 0;
+static PNL_TLOCAL double *pn_con_xbest = NULL; static PNL_TLOCAL int pn_con_xbest_len = 0;
+static PNL_TLOCAL double *pn_con_xtest = NULL; static PNL_TLOCAL int pn_con_xtest_len = 0;
+
+static int pn_resize_1d(double **buf, int *len, int sz)
+{
+  double *nbuf;
+  if( buf == NULL || len == NULL || sz < 1 ) return 1;
+  if( *len >= sz && *buf != NULL ) return 0;
+  nbuf = (double*)calloc((size_t)sz,sizeof(double));
+  if( nbuf == NULL ){
+    free(*buf); *buf = NULL; *len = 0;
+    return 1;
+  }
+  free(*buf); *buf = nbuf; *len = sz;
+  return 0;
+}
 
 #define AO_RESIZE_1D(name, sz) \
     do { if(name##_len < (sz)) { free(name); \
@@ -2272,6 +2296,16 @@ void powell_set_mfac( float mm , float aa )
   else            { mfac = 2.0f ; afac = 3.0f ; }  /* reset */
 }
 
+/* Read this thread's current sampling factors. mfac/afac are PNL_TLOCAL, so a
+   powell_set_mfac() on one thread does NOT configure OpenMP workers; a parallel
+   powell_newuoa() loop must capture the main thread's values with this and
+   re-apply them inside the parallel body (see al_register's candidate loops). */
+void powell_get_mfac( float *mm , float *aa )
+{
+  if( mm ) *mm = mfac ;
+  if( aa ) *aa = afac ;
+}
+
 /*---------------------------------------------------------------------------*/
 /*! Driver for Powell's general purpose minimization newuoa function:
     - ndim   = number of variables in function to be minimized
@@ -2286,13 +2320,17 @@ void powell_set_mfac( float mm , float aa )
     If return is negative, something bad happened.
 ------------------------------------------------------------------------------*/
 
+/* NEWUOA workspace for powell_newuoa(). Hoisted to file scope (was a function
+   static) so powell_newuoa_free_threadlocal() can release it: it is grow-only
+   and the dominant per-thread retained buffer (~64 KB at 12 DOF). */
+static PNL_TLOCAL double *pn_w = NULL ; static PNL_TLOCAL int pn_w_len = 0 ;
+
 int powell_newuoa( int ndim , double *x ,
                    double rstart , double rend ,
                    int maxcall , double (*ufunc)(int,double *) )
 {
    integer n , npt , icode , maxfun ;
    doublereal rhobeg , rhoend ;
-   static PNL_TLOCAL double *w = NULL ; static PNL_TLOCAL int w_len = 0 ;
 
    /* check inputs */
 
@@ -2313,7 +2351,12 @@ int powell_newuoa( int ndim , double *x ,
    rhoend = (doublereal)rend   ;
 
    icode   = (npt+14)*(npt+n) + 3*n*(n+3)/2 + 6666 ;
-   do { if(w_len < (icode)) { free(w); w = (double*)calloc((size_t)(icode),sizeof(double)); w_len = (icode); } } while(0) ;
+   if( pn_w_len < icode ){
+     free(pn_w);
+     pn_w = (double*)calloc((size_t)icode,sizeof(double)) ;
+     if( pn_w == NULL ){ pn_w_len = 0 ; return -7 ; }  /* alloc failed: don't run NEWUOA on NULL */
+     pn_w_len = icode ;
+   }
    icode   = 0 ;
    SET_USERFUN(ufunc) ;
    scalx = 0 ;
@@ -2321,21 +2364,30 @@ int powell_newuoa( int ndim , double *x ,
    /* do the work: best params are put back into x[] */
 
    (void)newuoa_( &n , &npt , (doublereal *)x ,
-                  &rhobeg , &rhoend , &maxfun , w , &icode ) ;
+                  &rhobeg , &rhoend , &maxfun , pn_w , &icode ) ;
 
    return icode ;  /* number of function calls */
+}
+
+/* Release the calling thread's grow-only NEWUOA workspace. Call once per
+   OpenMP thread at registration teardown (see al_register). Safe to call when
+   nothing was allocated (frees NULL). */
+void powell_newuoa_free_threadlocal( void )
+{
+   free(pn_w);      pn_w = NULL;      pn_w_len = 0;
+   free(sxmin_arr); sxmin_arr = NULL; sxmin_arr_len = 0;
+   free(sxsiz_arr); sxsiz_arr = NULL; sxsiz_arr_len = 0;
+   free(sx_arr);    sx_arr = NULL;    sx_arr_len = 0;
+   free(pn_con_x01);   pn_con_x01 = NULL;   pn_con_x01_len = 0;
+   free(pn_con_w);     pn_con_w = NULL;     pn_con_w_len = 0;
+   free(pn_con_xbest); pn_con_xbest = NULL; pn_con_xbest_len = 0;
+   free(pn_con_xtest); pn_con_xtest = NULL; pn_con_xtest_len = 0;
 }
 
 /*---------------------------------------------------------------------------*/
 
 static PNL_TLOCAL int con_meth = SC_BOX ;
 
-static void powell_newuoa_set_con_box (void){ con_meth = SC_BOX ; }
-static void powell_newuoa_set_con_ball(void){ con_meth = SC_BALL; }
-static int  powell_newuoa_get_con     (void){ return con_meth ;   }
-static void powell_newuoa_set_con     (int c){ con_meth = c ;     }
-
-/*---------------------------------------------------------------------------*/
 /*! Similar to powell_newuoa(), but with constraints on the variables,
     and (if nrand > 0) a random search for the starting vector (the initial
     vector on input in x[] is also tested to see if it is 'best' for starting).
@@ -2349,11 +2401,10 @@ int powell_newuoa_con( int ndim , double *x , double *xbot , double *xtop ,
                        double rstart , double rend ,
                        int maxcall , double (*ufunc)(int,double *) )
 {
-   integer n , npt , icode , maxfun , ncall=0 ;
+   integer n , npt , icode , maxfun ;
    doublereal rhobeg , rhoend ;
    int ii ;
-   static PNL_TLOCAL double *x01 = NULL ; static PNL_TLOCAL int x01_len = 0 ;
-   static PNL_TLOCAL double *w = NULL ; static PNL_TLOCAL int w_len = 0 ;
+   double *x01 ;
 
    /* check inputs */
 
@@ -2375,16 +2426,20 @@ int powell_newuoa_con( int ndim , double *x , double *xbot , double *xtop ,
    rhoend = (doublereal)rend   ;
 
    icode   = (npt+14)*(npt+n) + 3*n*(n+3)/2 + 666 ;
-   do { if(w_len < (icode)) { free(w); w = (double*)calloc((size_t)(icode),sizeof(double)); w_len = (icode); } } while(0) ;
+   if( pn_resize_1d(&pn_con_w,&pn_con_w_len,(int)icode) ) return -7 ;
 
    icode   = 0 ;
    SET_USERFUN(ufunc) ;
 
+   if( pn_resize_1d(&sxmin_arr,&sxmin_arr_len,ndim) ||
+       pn_resize_1d(&sxsiz_arr,&sxsiz_arr_len,ndim) ||
+       pn_resize_1d(&sx_arr,&sx_arr_len,ndim) ||
+       pn_resize_1d(&pn_con_x01,&pn_con_x01_len,ndim) ){
+     scalx = 0 ;
+     return -7 ;
+   }
+   x01 = pn_con_x01 ;
    scalx = con_meth ;
-   AO_RESIZE_1D(sxmin_arr,ndim) ;
-   AO_RESIZE_1D(sxsiz_arr,ndim) ;
-   AO_RESIZE_1D(sx_arr   ,ndim) ;
-   do { if(x01_len < (ndim)) { free(x01); x01 = (double*)calloc((size_t)(ndim),sizeof(double)); x01_len = (ndim); } } while(0) ;
    for( ii=0 ; ii < ndim ; ii++ ){
      sxmin_arr[ii] = xbot[ii] ;
      sxsiz_arr[ii] = xtop[ii] - xbot[ii]; if( sxsiz_arr[ii] <= 0.0 ) sxsiz_arr[ii] = 1.0;
@@ -2395,19 +2450,22 @@ int powell_newuoa_con( int ndim , double *x , double *xbot , double *xtop ,
    /*-- do a random search for the best starting vector? --*/
 
    if( nrand > 0 ){
-     static PNL_TLOCAL double *xbest = NULL ; static PNL_TLOCAL int xbest_len = 0 ;
-     static PNL_TLOCAL double *xtest = NULL ; static PNL_TLOCAL int xtest_len = 0 ;
+     double *xbest , *xtest ;
      double fbest , ftest ; int qq ;
      static PNL_TLOCAL int seed=1 ;
      if( seed ){ srand48((long)time(NULL)); seed=0; }
-     do { if(xbest_len < (ndim)) { free(xbest); xbest = (double*)calloc((size_t)(ndim),sizeof(double)); xbest_len = (ndim); } } while(0) ;
-     do { if(xtest_len < (ndim)) { free(xtest); xtest = (double*)calloc((size_t)(ndim),sizeof(double)); xtest_len = (ndim); } } while(0) ;
+     if( pn_resize_1d(&pn_con_xbest,&pn_con_xbest_len,ndim) ||
+         pn_resize_1d(&pn_con_xtest,&pn_con_xtest_len,ndim) ){
+       scalx = 0 ;
+       return -7 ;
+     }
+     xbest = pn_con_xbest ; xtest = pn_con_xtest ;
      memcpy(xbest,x01,sizeof(double)*ndim) ;
-     (void)calfun_(&n,xbest,&fbest) ; ncall++ ;
+     (void)calfun_(&n,xbest,&fbest) ;
      for( qq=0 ; qq < nrand ; qq++ ){
        for( ii=0 ; ii < ndim ; ii++ ) xtest[ii] = drand48() ;
        if( scalx != SC_BOX ) xreduce( ndim, xtest ) ;
-       (void)calfun_(&n,xtest,&ftest) ; ncall++ ;
+       (void)calfun_(&n,xtest,&ftest) ;
        if( ftest < fbest ){
          fbest = ftest; memcpy(xbest,xtest,sizeof(double)*ndim);
        }
@@ -2418,7 +2476,7 @@ int powell_newuoa_con( int ndim , double *x , double *xbot , double *xtop ,
    /****** optimize the scaled variables ******/
 
    (void)newuoa_( &n , &npt , (doublereal *)x01 ,
-                  &rhobeg , &rhoend , &maxfun , w , &icode ) ;
+                  &rhobeg , &rhoend , &maxfun , pn_con_w , &icode ) ;
 
    /*-- Rescale output back to 'true' range --*/
 
