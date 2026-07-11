@@ -90,7 +90,14 @@ static nifti_dmat44 mat44_to_dmat44(mat44 f) {
 
 /* Sparse sampling: fraction of task voxels for fine-pass matching (AFNI default) */
 #define AL_SPARSE_SAMPLE_FRAC  0.47
-#define AL_NPT_MATCH_MIN      9999
+/* Coarse-pass matching-point floor. MUST match AFNI's nmatch_setup (98765). An earlier
+   distillation used 9999 (~10x fewer), which under-samples the coarse cost surface: on a
+   cross-modal / offset case (T2w->avg152T1, header centroids ~25 mm apart) the noisy coarse
+   Hellinger landed in a wrong rotation/translation basin from the header start, needing
+   -cmass to recover (0.760 -> 0.840 L-R symmetry). Restoring AFNI's 98765 makes the coarse
+   surface clean enough to find the right basin WITHOUT -cmass (0.833, matching AFNI's 0.826),
+   with negligible added time (the coarse pass is 2x-downsampled and a small fraction of total). */
+#define AL_NPT_MATCH_MIN      98765
 
 /* Cost function method codes (subset of AFNI's full list) */
 #define GA_MATCH_PEARSON_SCALAR        1
@@ -198,6 +205,8 @@ typedef struct {
     int bnx, bny, bnz;    /* base dimensions */
     float bdx, bdy, bdz;  /* base voxel sizes */
     float bsbot, bstop, bsclip;
+    float bs_topclip;      /* AFNI mri_topclip: histogram-MEMBERSHIP top (drop above); distinct
+                              from bsclip = clipate top used for edge-binning */
     unsigned char *bmask;  /* base mask */
     float *bwght;          /* base weights */
     int nmask;
@@ -208,7 +217,15 @@ typedef struct {
     int anx, any, anz;     /* source dimensions */
     float adx, ady, adz;   /* source voxel sizes */
     float ajbot, ajtop, ajclip;
+    float aj_topclip;      /* AFNI mri_topclip: histogram-MEMBERSHIP top (drop above); distinct
+                              from ajclip = clipate top used for edge-binning */
     float ajmin, ajmax;    /* original data range (for cubic overshoot clamping) */
+    /* AFNI set_2Dhist_xyclip: edge-bin clips from the SAMPLE distribution, recomputed per
+       stage. hxc=source(x), hyc=base(y). need_hist_setup is set at each stage's setup and
+       consumed (compute + clear) by the stage's FIRST, sequential cost eval — never in the
+       parallel region — so the result is deterministic (mirrors AFNI GA_scalar_fitter). */
+    float hxc_bot, hxc_top, hyc_bot, hyc_top;
+    int   need_hist_setup;
     unsigned char *ajmask;  /* source mask */
     int najmask;
 
@@ -485,7 +502,7 @@ static int al_mat44_usable(mat44 m)
  * preferred form is unset or degenerate ("bogus"), fall back to whichever form
  * is usable. Writes *out and returns 0 on success; returns 1 when neither the
  * sform nor the qform yields a usable transform (caller should error out). */
-static int al_image_xform(const nifti_image *nim, mat44 *out)
+int al_image_xform(const nifti_image *nim, mat44 *out)
 {
     mat44 s, q;
     int shave = (nim->sform_code > 0);
@@ -1265,6 +1282,12 @@ static AL_TLOCAL float *al_xc = NULL, *al_yc = NULL, *al_xyc = NULL;
 static AL_TLOCAL float al_nww = 0.0f;
 static AL_TLOCAL int al_nbin = 0, al_nbp = 0, al_nbm = 0;
 static AL_TLOCAL int al_nbp_cap = 0;
+static AL_TLOCAL unsigned char *al_good = NULL;  /* build_2Dhist per-eval good[] mask, reused */
+static AL_TLOCAL int al_good_cap = 0;
+static AL_TLOCAL int al_hist_oom = 0;   /* set ONLY on a histogram-buffer alloc failure in
+                                           build_2Dhist, so the cost path can distinguish a real
+                                           OOM (reject → AL_BIGVAL) from a legitimately empty
+                                           histogram (n<=9 / constant range / no overlap → cost 0). */
 static double al_hpow = 0.33333333333;
 
 #undef  XYC
@@ -1289,7 +1312,8 @@ static void clear_2Dhist(void)
     if (al_xc)  { free(al_xc);  al_xc = NULL; }
     if (al_yc)  { free(al_yc);  al_yc = NULL; }
     if (al_xyc) { free(al_xyc); al_xyc = NULL; }
-    al_nbp_cap = 0;
+    if (al_good) { free(al_good); al_good = NULL; }
+    al_nbp_cap = 0; al_good_cap = 0;
     reset_2Dhist_state();
 }
 
@@ -1321,21 +1345,37 @@ static int ensure_2Dhist_capacity(int nbp)
    all data points in the histogram while concentrating resolution on the
    informative intensity range. */
 static void build_2Dhist(int n, float xbot, float xtop, float *x,
-                                float ybot, float ytop, float *y, float *w)
+                                float ybot, float ytop, float *y, float *w,
+                                float xmemtop, float ymemtop)
 {
     int ii, jj, kk, ngood;
     float xi, yi, xx, yy, x1, y1, ww;
     unsigned char *good;
     float xdbot, xdtop, ydbot, ydtop; /* actual data range */
 
+    al_hist_oom = 0;   /* cleared at entry; set below ONLY on a genuine malloc failure */
     if (n <= 9 || x == NULL || y == NULL) return;
 
     reset_2Dhist_state();
 
-    good = (unsigned char *)malloc(n);
-    if (!good) return;
+    /* Reuse the thread-local good[] mask across evals (build_2Dhist runs once per Hellinger cost
+       evaluation — a per-eval malloc/free in the hot path otherwise). Grow-only; freed by
+       clear_2Dhist() alongside the histogram buffers. */
+    if (al_good_cap < n) {
+        free(al_good);
+        al_good = (unsigned char *)malloc((size_t)n);
+        al_good_cap = al_good ? n : 0;
+    }
+    good = al_good;
+    if (!good) { al_hist_oom = 1; return; }   /* OOM, not a legitimately empty histogram */
+    /* Histogram MEMBERSHIP: drop any pair with a value above its image's mri_topclip
+       (xmemtop/ymemtop). This is AFNI's `good[]` over [min, topclip] — it excludes bright
+       outliers (e.g. a T2 source's CSF/fat/orbits, non-brain the T1 base lacks) so they can't
+       bias the fit toward a shrunk overlap. xmemtop<=0 disables the drop for that axis. */
     for (ii = 0; ii < n; ii++)
-        good[ii] = GOODVAL(x[ii]) && GOODVAL(y[ii]);
+        good[ii] = GOODVAL(x[ii]) && GOODVAL(y[ii])
+                   && (xmemtop <= 0.0f || x[ii] <= xmemtop)
+                   && (ymemtop <= 0.0f || y[ii] <= ymemtop);
 
     /* Find actual data range */
     xdbot = WAY_BIG; xdtop = -WAY_BIG;
@@ -1347,7 +1387,7 @@ static void build_2Dhist(int n, float xbot, float xtop, float *x,
         if (y[ii] > ydtop) ydtop = y[ii];
         if (y[ii] < ydbot) ydbot = y[ii];
     }
-    if (xdbot >= xdtop || ydbot >= ydtop) { free(good); return; }
+    if (xdbot >= xdtop || ydbot >= ydtop) { return; }
 
     /* Count good values in actual data range */
     memset(good, 0, n);
@@ -1356,7 +1396,7 @@ static void build_2Dhist(int n, float xbot, float xtop, float *x,
             good[ii] = 1; ngood++;
         }
     }
-    if (ngood == 0) { free(good); return; }
+    if (ngood == 0) { return; }
 
     /* Compute number of bins from total n (matches AFNI) */
     al_nbin = (int)pow((double)n, al_hpow);
@@ -1365,7 +1405,7 @@ static void build_2Dhist(int n, float xbot, float xtop, float *x,
     al_nbp = al_nbin + 1;
     al_nbm = al_nbin - 1;
 
-    if (ensure_2Dhist_capacity(al_nbp)) { free(good); return; }
+    if (ensure_2Dhist_capacity(al_nbp)) { al_hist_oom = 1; return; }   /* histogram-buffer OOM */
     memset(al_xc, 0, (size_t)al_nbp * sizeof(float));
     memset(al_yc, 0, (size_t)al_nbp * sizeof(float));
     memset(al_xyc, 0, (size_t)al_nbp * (size_t)al_nbp * sizeof(float));
@@ -1428,7 +1468,6 @@ static void build_2Dhist(int n, float xbot, float xtop, float *x,
             XYC(jj + 1, kk + 1) += xx * (yy * ww);
         }
     }
-    free(good);
 }
 
 static void normalize_2Dhist(void)
@@ -1446,14 +1485,15 @@ static void normalize_2Dhist(void)
 typedef struct { float a, b, c, d; } float_quad;
 
 static float_quad al_helmicra(int n, float xbot, float xtop, float *x,
-                              float ybot, float ytop, float *y, float *w)
+                              float ybot, float ytop, float *y, float *w,
+                              float xmemtop, float ymemtop)
 {
     int ii, jj;
     float hel, pq, vv, uu;
     float cyvar, uyvar, yrat, xrat;
     float_quad hmc = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    build_2Dhist(n, xbot, xtop, x, ybot, ytop, y, w);
+    build_2Dhist(n, xbot, xtop, x, ybot, ytop, y, w, xmemtop, ymemtop);
     if (al_nbin <= 0 || al_nww <= 0) return hmc;
     normalize_2Dhist();
 
@@ -2013,10 +2053,10 @@ static int GA_get_warped_values(int nmpar, double *mpar, float *avm)
         GA_warp_interp_fused(gam, aim, gstup->anx, gstup->any, gstup->anz,
                               gstup->bnx, gstup->bny, gstup->bnz,
                               gstup->interp_code, avm);
-        /* Clip for cubic */
+        /* Clip cubic overshoot to the original source range, matching the general path. */
         if (gstup->interp_code == AL_INTERP_CUBIC) {
             npt = gstup->bnx * gstup->bny * gstup->bnz;
-            al_clip_values(avm, npt, gstup->ajbot, gstup->ajtop);
+            al_clip_values(avm, npt, gstup->ajmin, gstup->ajmax);
         }
         return 0;
     }
@@ -2287,8 +2327,10 @@ static double GA_scalar_costfun(int meth, int npt,
 
         case GA_MATCH_HELLINGER_SCALAR: { /* Hellinger only (fast, cross-modal) */
             float_quad hmc;
-            hmc = al_helmicra(npt, gstup->ajbot, gstup->ajclip, avm,
-                                   gstup->bsbot, gstup->bsclip, bvm, wvm);
+            hmc = al_helmicra(npt, gstup->hxc_bot, gstup->hxc_top, avm,
+                                   gstup->hyc_bot, gstup->hyc_top, bvm, wvm,
+                                   gstup->aj_topclip, gstup->bs_topclip);
+            if (al_hist_oom) return (double)AL_BIGVAL; /* histogram OOM: reject, not a cost-0 "win" */
             val = -(double)hmc.a; /* aligned → hmc.a > 0 → val negative → good for min */
         } break;
 
@@ -2311,8 +2353,10 @@ static double GA_scalar_costfun(int meth, int npt,
                 gstup->micho_nmi != 0.0 || gstup->micho_crA != 0.0) {
                 float_quad hmc;
                 float ovv;
-                hmc = al_helmicra(npt, gstup->ajbot, gstup->ajclip, avm,
-                                       gstup->bsbot, gstup->bsclip, bvm, wvm);
+                hmc = al_helmicra(npt, gstup->hxc_bot, gstup->hxc_top, avm,
+                                       gstup->hyc_bot, gstup->hyc_top, bvm, wvm,
+                                       gstup->aj_topclip, gstup->bs_topclip);
+                if (al_hist_oom) return (double)AL_BIGVAL; /* histogram OOM: reject this eval */
                 val += -gstup->micho_hel * hmc.a - gstup->micho_mi * hmc.b
                        + gstup->micho_nmi * hmc.c + gstup->micho_crA * (1.0 - fabs(hmc.d));
 
@@ -2369,6 +2413,24 @@ static double GA_scalar_fitter(int npar, double *mpar)
 
     bvm = gstup->bvm;
     wvm = gstup->wvm;
+
+    /* AFNI set_2Dhist_xyclip (GA_scalar_fitter): on the first cost eval of a stage, compute the
+       histogram edge-bin clips from the LIVE sample distribution (warped source avm + base bvm)
+       and cache them, then clear the flag. This runs on the stage's first, SEQUENTIAL eval (the
+       coarse ransetup center eval / the refinement warm-up eval) — never inside the parallel
+       region — so the shared write is race-free and deterministic. Falls back to the image
+       clipate defaults on a degenerate clip. Recomputing on the live samples is why AFNI keeps
+       the cross-modal histogram resolution on the informative range as alignment improves. */
+    if (gstup->need_hist_setup) {
+        al_float_pair xc = al_clipate(npt, avm);
+        al_float_pair yc = al_clipate(npt, bvm);
+        if (xc.a < xc.b) { gstup->hxc_bot = xc.a; gstup->hxc_top = xc.b; }
+        if (yc.a < yc.b) { gstup->hyc_bot = yc.a; gstup->hyc_top = yc.b; }
+        gstup->need_hist_setup = 0;
+        if (getenv("AL_VERB"))
+            fprintf(stderr, "[AL_VERB hist] source clip %.4g .. %.4g; base clip %.4g .. %.4g\n",
+                    gstup->hxc_bot, gstup->hxc_top, gstup->hyc_bot, gstup->hyc_top);
+    }
 
     /* -dark_automask: zero the weight of any matched pair whose base or warped-source
        value is at that image's darkest value (background/pad). Folds into the existing
@@ -2511,6 +2573,17 @@ static void al_scalar_setup(GA_setup *stup)
         }
     }
 
+    /* The topclip-membership + live sample-clip (need_hist_setup) machinery is consumed ONLY by
+       the histogram costs (Hellinger, and the -DAL_LPC_MICHO helper terms). For ls/lpc/lpa it is
+       pure wasted work — a full-image quantile per axis, a per-stage sample clipate, and a
+       discarded sequential warm-up eval. Gate it on the cost so those paths skip it. The default
+       (Hellinger) is byte-for-byte unchanged (hist_cost == 1). */
+    int hist_cost = (stup->match_code == GA_MATCH_HELLINGER_SCALAR);
+#ifdef AL_LPC_MICHO
+    hist_cost = hist_cost || stup->match_code == GA_MATCH_LPC_MICHO_SCALAR
+                          || stup->match_code == GA_MATCH_LPA_MICHO_SCALAR;
+#endif
+
     /* Get min/max and CLEQWD clip levels for source image */
     {
         float *src = (stup->ajims != NULL) ? stup->ajims : stup->ajim;
@@ -2523,8 +2596,18 @@ static void al_scalar_setup(GA_setup *stup)
         stup->ajmin = stup->ajbot;  /* preserve original data range */
         stup->ajmax = stup->ajtop;
         stup->ajclip = stup->ajtop;
-        /* Apply CLEQWD clipping for histogram-based cost functions */
-        if (stup->match_code != GA_MATCH_PEARSON_SCALAR) {
+        /* AFNI mri_topclip = MIN(3.11*THD_cliplevel(0.511), max) for non-negative images:
+           the histogram-MEMBERSHIP top (pairs with a value above this are DROPPED, matching
+           AFNI). Negative images (e.g. CT) keep the full range. Distinct from the clipate
+           edge-bin clip below — collapsing the two lets bright cross-modal outliers (T2 CSF/
+           fat) bias the fit toward shrinking overlap (see AGENTS.md). */
+        stup->aj_topclip = stup->ajmax;
+        if (hist_cost && stup->ajmin >= 0.0f) {
+            float tc = 3.11f * al_cliplevel(nvox, src, 0.511f);
+            if (tc < stup->aj_topclip) stup->aj_topclip = tc;
+        }
+        /* CLEQWD edge-bin clips are consumed only by histogram costs. */
+        if (hist_cost) {
             al_float_pair cp = al_clipate(nvox, src);
             if (cp.a < cp.b) { stup->ajbot = cp.a; stup->ajclip = cp.b; }
         }
@@ -2540,12 +2623,23 @@ static void al_scalar_setup(GA_setup *stup)
             if (bas[ii] > stup->bstop) stup->bstop = bas[ii];
         }
         stup->bsclip = stup->bstop;
-        /* Apply CLEQWD clipping for histogram-based cost functions */
-        if (stup->match_code != GA_MATCH_PEARSON_SCALAR) {
+        /* AFNI mri_topclip membership top for the base (see source block above). */
+        stup->bs_topclip = stup->bstop;
+        if (hist_cost && stup->bsbot >= 0.0f) {
+            float tc = 3.11f * al_cliplevel(nvox, bas, 0.511f);
+            if (tc < stup->bs_topclip) stup->bs_topclip = tc;
+        }
+        /* CLEQWD edge-bin clips are consumed only by histogram costs. */
+        if (hist_cost) {
             al_float_pair cp = al_clipate(nvox, bas);
             if (cp.a < cp.b) { stup->bsbot = cp.a; stup->bsclip = cp.b; }
         }
     }
+    /* Edge-bin clips default to the image clipate (the fallback); the stage's first cost eval
+       refreshes them from the live sample distribution (AFNI set_2Dhist_xyclip). */
+    stup->hxc_bot = stup->ajbot; stup->hxc_top = stup->ajclip;
+    stup->hyc_bot = stup->bsbot; stup->hyc_top = stup->bsclip;
+    stup->need_hist_setup = hist_cost;   /* refresh live sample clips only for histogram costs */
 
     /* Determine number of matching points */
     nmatch = stup->npt_match;
@@ -2554,6 +2648,13 @@ static void al_scalar_setup(GA_setup *stup)
     if (stup->nmask > 0 && nmatch > stup->nmask)
         nmatch = stup->nmask;
     stup->npt_match = nmatch;
+    if (getenv("AL_VERB"))
+        fprintf(stderr, "[AL_VERB setup] smooth=%.2f npt_match=%d nmask=%d | "
+                "src range %.4g..%.4g clip %.4g..%.4g topclip %.4g | "
+                "base range %.4g..%.4g clip %.4g..%.4g topclip %.4g\n",
+                stup->smooth_radius_base, stup->npt_match, stup->nmask,
+                stup->ajmin, stup->ajmax, stup->ajbot, stup->ajclip, stup->aj_topclip,
+                stup->bsbot, stup->bstop, stup->bsbot, stup->bsclip, stup->bs_topclip);
 
     /* Free old control point arrays */
     if (stup->im_ar) { free(stup->im_ar); stup->im_ar = NULL; }
@@ -2679,7 +2780,12 @@ static int al_scalar_optim(GA_setup *stup, double rstart, double rend, int nstep
 
     nfunc = powell_newuoa(stup->wfunc_numfree, wpar, rstart, rend, nstep, GA_scalar_fitter);
     if (nfunc < 0) { free(wpar); return nfunc; }  /* optimizer OOM: don't accept unoptimized params */
-    stup->vbest = (float)GA_scalar_fitter(stup->wfunc_numfree, wpar);
+    double final_cost = GA_scalar_fitter(stup->wfunc_numfree, wpar);
+    if (!(final_cost < (double)AL_BIGVAL)) {
+        free(wpar);
+        return -4;  /* invalid/failed final evaluation: do not report an unscored fit */
+    }
+    stup->vbest = (float)final_cost;
 
     /* Copy results back */
     for (ii = qq = 0; qq < stup->wfunc_numpar; qq++) {
@@ -3551,6 +3657,16 @@ static int al_register(nifti_image *source, nifti_image *base,
             return 1;
         }
         stup.nmask = 0;
+        /* AFNI's default weight for the histogram/box-mode costs (Hellinger, MI, NMI, CR) is
+           `-autobox` (auto_weight=3): BINARIZE the weight so every in-mask voxel is weighted
+           equally. Only ls/lpc/lpa keep the graded intensity weight (auto_weight=1). A graded
+           weight down-weights the cortical periphery, which lets the fit shrink/expand the
+           overlap unpenalized (the T2w->T1 shrink: peripheral voxels pushed out of FOV cost
+           little); the binary weight anchors the full brain extent, so the fit contracts to
+           fill (det 0.94->0.74, matching AFNI's 0.72). See AGENTS.md. */
+        int box_weight = (match_code != GA_MATCH_PEARSON_SCALAR &&
+                          match_code != GA_MATCH_PEARSON_LOCALS &&
+                          match_code != GA_MATCH_PEARSON_LOCALA);
         float wmx = 0.0f;
         for (ii = 0; ii < nvox_base; ii++) if (wght[ii] > wmx) wmx = wght[ii];
         if (wmx > 0.0f) {
@@ -3558,7 +3674,7 @@ static int al_register(nifti_image *source, nifti_image *base,
             for (ii = 0; ii < nvox_base; ii++) {
                 wght[ii] = fabsf(wght[ii]) * inv;
                 stup.bmask[ii] = (wght[ii] > 0.0f) ? 1 : 0;
-                if (stup.bmask[ii]) stup.nmask++;
+                if (stup.bmask[ii]) { stup.nmask++; if (box_weight) wght[ii] = 1.0f; }
             }
         }
     }
@@ -3889,6 +4005,10 @@ static int al_register(nifti_image *source, nifti_image *base,
     if (al_scalar_ransetup(&stup, nrand) != 0) {
         reg_rc = 1; goto al_cleanup;
     }
+    if (getenv("AL_VERB"))
+        fprintf(stderr, "[AL_VERB coarse] best rigid pose: shift=(%.1f,%.1f,%.1f) angle=(%.1f,%.1f,%.1f)\n",
+                stup.wfunc_param[0].val_init, stup.wfunc_param[1].val_init, stup.wfunc_param[2].val_init,
+                stup.wfunc_param[3].val_init, stup.wfunc_param[4].val_init, stup.wfunc_param[5].val_init);
 
     /* Restore full-resolution source for refinement rounds */
     if (ajim_ds) {
@@ -3974,6 +4094,12 @@ static int al_register(nifti_image *source, nifti_image *base,
             }
         }
 
+        /* Consume need_hist_setup (armed by al_scalar_setup above) with ONE sequential eval at
+           candidate 0 — refreshing the sample-based edge-bin clips before the parallel region,
+           so the shared write is race-free (AFNI refreshes on candidate 0, whose refinement it
+           runs first). */
+        if (tfdone > 0 && stup.need_hist_setup) (void)GA_scalar_fitter(nfr_ref, cand_wpar[0]);
+
 #ifdef _OPENMP
         #pragma omp parallel for schedule(dynamic)
 #endif
@@ -4009,6 +4135,11 @@ static int al_register(nifti_image *source, nifti_image *base,
             qsort_floatint(tfdone, tfcost, tfindx);
             for (int ib = 0; ib < tfdone; ib++)
                 memcpy(tfparm[ib], ffparm[tfindx[ib]], sizeof(float) * 12);
+            if (getenv("AL_VERB"))
+                fprintf(stderr, "[AL_VERB refine#%d] best cost=%.5f  scale=(%.3f,%.3f,%.3f) "
+                        "shear=(%.3f,%.3f,%.3f) shift=(%.1f,%.1f,%.1f) angle=(%.1f,%.1f,%.1f)\n", rr + 1, tfcost[0],
+                        tfparm[0][6], tfparm[0][7], tfparm[0][8], tfparm[0][9], tfparm[0][10], tfparm[0][11],
+                        tfparm[0][0], tfparm[0][1], tfparm[0][2], tfparm[0][3], tfparm[0][4], tfparm[0][5]);
 
             /* Cast out parameter sets too close to the best */
 #define CTHRESH 0.02f
@@ -4083,6 +4214,10 @@ static int al_register(nifti_image *source, nifti_image *base,
         }
 
         gstup = &stup;
+        /* Consume need_hist_setup (armed by the fine-pass al_scalar_setup) with ONE sequential
+           eval at candidate 0 — refresh the sample-based clips before the parallel region so the
+           shared write stays race-free and p1==pN bit-identical. */
+        if (tfdone > 0 && stup.need_hist_setup) (void)GA_scalar_fitter(nfr, cand_wpar[0]);
         /* re-apply the main thread's thread-local sampling factors per worker */
         float fc_mfac, fc_afac; powell_get_mfac(&fc_mfac, &fc_afac);
 #ifdef _OPENMP

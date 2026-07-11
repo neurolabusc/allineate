@@ -21,6 +21,21 @@
 #define AL_CMASS_NONE     0  /* No center-of-mass alignment */
 #define AL_CMASS_YES      1  /* Use center-of-mass for initial shift */
 
+/* Registration engine selector (al_opts.fast). The fast engine is a second, explicitly
+   selected estimator (coreg_fast.c); the value also carries which fast cost to use. */
+#define AL_ENGINE_ALLINEATE 0  /* default allineate engine (nii_allineate) */
+#define AL_ENGINE_FAST_CR   1  /* fast engine, correlation-ratio cost  (-cost fastcr) */
+#define AL_ENGINE_FAST_HEL  2  /* fast engine, Hellinger cost          (-cost fast) */
+
+/* al_opts.cli_set bits — which override options the user explicitly passed. Split
+   matching-interp (-interp) from output-interp (-final/-nearest/-linear/-cubic): the
+   fast engine honors -final for its one output reslice but ignores matching -interp. */
+#define AL_CLI_COST   0x1u
+#define AL_CLI_WARP   0x2u
+#define AL_CLI_INTERP 0x4u   /* -interp (fine-pass MATCHING interpolation) */
+#define AL_CLI_FINAL  0x8u   /* -final / -nearest / -linear / -cubic (OUTPUT interpolation) */
+#define AL_CLI_CMASS  0x10u  /* -cmass / -nocmass */
+
 /* Warp type codes (number of free parameters) */
 #define AL_WARP_SHIFT_ONLY          3  /* shift_only / sho: 3 DOF */
 #define AL_WARP_SHIFT_ROTATE        6  /* shift_rotate / shr: 6 DOF */
@@ -53,12 +68,23 @@ typedef struct {
                                (via nii_last_affine()). NULL = don't save. */
     const char *applymat;   /* CLI-only: -applymat path; apply a saved affine JSON to reslice
                                the moving image onto the stationary grid (no registration). */
+    const char *master;     /* CLI-only: -master output-grid image. Register at the stationary
+                               resolution, but reslice the result onto THIS grid instead (must
+                               share the stationary world frame, e.g. a higher-res template).
+                               NULL = output on the stationary grid. */
     int com;                /* CLI-only: -com set origin to brightness center of mass (1 = on) */
     int sym;                /* CLI-only: -sym/-symd midsagittal alignment (1 = enabled, 0 = disabled) */
     int sym_deoblique;      /* CLI-only: 0 = -sym; 1 = -symd (snap the frame axis-aligned
                                before the mirror fit); 2 = -symb (auto-compete both) */
     int sagseed;            /* CLI-only: -sagseed in-MSP rigid seed after -sym (default 1;
                                -nosagseed disables). Only acts when -sym runs with a template. */
+    unsigned cli_set;       /* CLI-only: bitmask of explicitly-passed override options
+                               (AL_CLI_*), so a distinct engine can reject options it
+                               cannot honor (e.g. the fast engine rejects -warp/-interp; it
+                               honors -cmass/-nocmass via AL_CLI_CMASS). */
+    int fast;               /* CLI-only: registration engine selector (AL_ENGINE_*). Interpreted
+                               by main.c (dispatches to coreg_fast_estimate); nii_allineate()
+                               ignores it. */
     int zoom;               /* CLI-only: -zoom — flags abnormal size (e.g. infant vs adult
                                template): adds a global isotropic scale DOF to the -sagseed
                                seed fit AND widens the main affine's scale range to [0.5,2.0]
@@ -80,10 +106,13 @@ static inline al_opts al_opts_default(void) {
     o.robustfov = 0.0;
     o.savemat = NULL;
     o.applymat = NULL;
+    o.master = NULL;
     o.com = 0;
     o.sym = 0;
     o.sym_deoblique = 0;
     o.sagseed = 1;
+    o.cli_set = 0;
+    o.fast = 0;
     o.zoom = 0;
     return o;
 }
@@ -147,6 +176,15 @@ static inline const char *al_cost_name(int cost) {
 
 /* The registration/deface API uses process-global and thread-local workspaces.
    It is safe for serial CLI-style use, but not for concurrent calls. */
+
+/* Choose an image's index->world (mm) transform with NIfTI sform/qform precedence
+   and validity policy (prefer sform when sform_code >= qform_code, else qform; fall
+   back to whichever form is usable; a degenerate/bogus preferred form is skipped).
+   Writes *out and returns 0 on success; returns 1 when neither form is usable.
+   Pure helper (no global state) shared with the fast coreg path (coreg_fast.c).
+   Exposed non-static in Phase 2 of the fast-coreg work with NO logic change —
+   exact parity holds (a no-logic-change exposure). */
+int al_image_xform(const nifti_image *nim, mat44 *out);
 
 /* Register source image to base image grid using affine (12 DOF) alignment.
    source: the moving image (will be modified in-place: data replaced, dims updated)

@@ -70,8 +70,13 @@ int nii_ensure_float32(nifti_image *nim) {
     float *out = (float *)malloc(nbytes);
     if (!out) return 1;
 
-    double slope = (nim->scl_slope == 0.0) ? 1.0 : nim->scl_slope;
-    double inter = nim->scl_inter;
+    /* Apply scaling ONLY when scl_slope != 0 and not the identity (slope 1,
+     * inter 0). Per the NIfTI spec a zero slope means "no scaling" — the
+     * intercept must NOT be added either. Matches cf_extract_float()/nii_to_float(). */
+    int do_scale = (nim->scl_slope != 0.0 &&
+                    !(nim->scl_slope == 1.0 && nim->scl_inter == 0.0));
+    double slope = do_scale ? nim->scl_slope : 1.0;
+    double inter = do_scale ? nim->scl_inter : 0.0;
     void *in = nim->data;
 
     #define CONV(CTYPE)                                                    \
@@ -296,5 +301,191 @@ int nifti_robustfov(nifti_image *nim, double fovmm) {
     nim->nvox = (int64_t)nnewTot;
     free(nim->data);
     nim->data = out;
+    return 0;
+}
+
+/*==========================================================================*/
+/* Gaussian blur — clean-room-permitted port of niimath coreFLT.c            */
+/* (nifti_smooth_gauss / blurS / blurP / transposeXY / transposeXZ), BSD/    */
+/* public-domain (NOT src/GPL/). Adapted to operate on a raw float buffer +  */
+/* explicit dims/pixdim instead of a nifti_image; flt->float; printfx->      */
+/* stderr; sigma passed in mm (per axis). Clean-room BSD port, see AGENTS.md.            */
+/*==========================================================================*/
+
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
+
+#ifndef MIN
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#endif
+
+/* transpose X<->Y (rows<->columns) of an nx*ny*nz volume into out */
+static inline void mcf_transposeXY(float *in, float *out, int *nxp, int *nyp, int nz) {
+    int nx = *nxp, ny = *nyp;
+    size_t vi = 0;
+    for (int z = 0; z < nz; z++) {
+        int zo = z * nx * ny;
+        for (int y = 0; y < ny; y++) {
+            int xo = 0;
+            for (int x = 0; x < nx; x++) { out[zo + xo + y] = in[vi]; xo += ny; vi++; }
+        }
+    }
+    *nxp = ny; *nyp = nx;
+}
+
+/* transpose X<->Z (slices<->columns) of an nx*ny*nz volume into out */
+static inline void mcf_transposeXZ(float *in, float *out, int *nxp, int ny, int *nzp) {
+    int nx = *nxp, nz = *nzp, nyz = ny * nz;
+    size_t vi = 0;
+    for (int z = 0; z < nz; z++) {
+        for (int y = 0; y < ny; y++) {
+            int yo = y * nz, zo = 0;
+            for (int x = 0; x < nx; x++) { out[z + yo + zo] = in[vi]; zo += nyz; vi++; }
+        }
+    }
+    *nxp = nz; *nzp = nx;
+}
+
+/* Blur the leading dimension (length nx) of ny contiguous rows. sigma in mm.
+   Returns 0 on success, 1 on allocation failure. */
+static int mcf_blur1d(float *img, int nx, int ny, float xmm, float sigma_mm,
+                      float kernelWid, int parallel) {
+    if (xmm == 0.0f || nx < 2 || ny < 1 || sigma_mm <= 0.0f) return 0;
+    float sigma = sigma_mm / xmm;   /* mm -> voxels */
+    /* Samples beyond the row ends can never contribute. Capping before conversion
+       avoids oversized kernels and keeps extreme-but-finite voxel sizes out of an
+       overflowing float-to-int conversion. */
+    double radius = fabs((double)kernelWid * (double)sigma);
+    int cutoffvox = (!(radius < nx - 1)) ? nx - 1
+                    : (kernelWid < 0) ? (int)lround(radius) : (int)ceil(radius);
+    if (cutoffvox < 1) cutoffvox = 1;
+    float *k = (float *)malloc((size_t)(cutoffvox + 1) * sizeof(float));
+    int *kStart = (int *)malloc((size_t)nx * sizeof(int));
+    int *kEnd   = (int *)malloc((size_t)nx * sizeof(int));
+    float *kWeight = (float *)malloc((size_t)nx * sizeof(float));
+    if (!k || !kStart || !kEnd || !kWeight) {
+        free(k); free(kStart); free(kEnd); free(kWeight); return 1;
+    }
+    float expd = 2.0f * sigma * sigma;
+    for (int i = 0; i <= cutoffvox; i++) k[i] = expf(-1.0f * (i * i) / expd);
+    for (int i = 0; i < nx; i++) {
+        kStart[i] = MAX(-cutoffvox, -i);
+        kEnd[i]   = MIN(cutoffvox, nx - i - 1);
+        if (i > 0 && kStart[i] == kStart[i-1] && kEnd[i] == kEnd[i-1]) {
+            kWeight[i] = kWeight[i-1]; continue;
+        }
+        float wt = 0.0f;
+        for (int j = kStart[i]; j <= kEnd[i]; j++) wt += k[abs(j)];
+        kWeight[i] = 1.0f / wt;
+    }
+    int failed = 0;
+#if defined(_OPENMP)
+    if (parallel) {
+        /* One scratch row per thread (not per row): removes allocator
+           contention, and — because the failure flag is resolved BEFORE the
+           parallel region — removes the unsynchronized write to `failed` from
+           inside the loop. Blur math and per-row write order are unchanged, so
+           the output is bit-identical at any thread count. */
+        int nthreads = omp_get_max_threads();
+        if (nthreads > ny) nthreads = ny;
+        float **scratch = (float **)calloc((size_t)nthreads, sizeof(float *));
+        if (!scratch) failed = 1;
+        else {
+            for (int t = 0; t < nthreads; t++) {
+                scratch[t] = (float *)malloc((size_t)nx * sizeof(float));
+                if (!scratch[t]) { failed = 1; break; }
+            }
+            if (!failed) {
+                #pragma omp parallel for num_threads(nthreads)
+                for (int y = 0; y < ny; y++) {
+                    float *tmp = scratch[omp_get_thread_num()];
+                    float *row = img + (size_t)nx * y;
+                    memcpy(tmp, row, (size_t)nx * sizeof(float));
+                    for (int x = 0; x < nx; x++) {
+                        float sum = 0.0f;
+                        for (int i = kStart[x]; i <= kEnd[x]; i++) sum += tmp[x + i] * k[abs(i)];
+                        row[x] = sum * kWeight[x];
+                    }
+                }
+            }
+            for (int t = 0; t < nthreads; t++) free(scratch[t]);
+            free(scratch);
+        }
+    } else
+#else
+    (void)parallel;
+#endif
+    {
+        float *tmp = (float *)malloc((size_t)nx * sizeof(float));
+        if (!tmp) failed = 1;
+        else {
+            float *row = img;
+            for (int y = 0; y < ny; y++) {
+                memcpy(tmp, row, (size_t)nx * sizeof(float));
+                for (int x = 0; x < nx; x++) {
+                    float sum = 0.0f;
+                    for (int i = kStart[x]; i <= kEnd[x]; i++) sum += tmp[x + i] * k[abs(i)];
+                    row[x] = sum * kWeight[x];
+                }
+                row += nx;
+            }
+            free(tmp);
+        }
+    }
+    free(k); free(kStart); free(kEnd); free(kWeight);
+    return failed;
+}
+
+int mcf_smooth_gauss(float *data, int nx, int ny, int nz,
+                     float dx, float dy, float dz,
+                     float sigX_mm, float sigY_mm, float sigZ_mm, float kernelWid) {
+    if (!data || nx < 1 || ny < 1 || nz < 1) return 1;
+    size_t nvox3D;
+    if (mc_mul((size_t)nx * ny, (size_t)nz, &nvox3D)) return 1;
+    if (nvox3D < 2) return 1;
+    /* Precondition: the spatial product nx*ny*nz must fit in a signed int. The
+       blur/transpose helpers (mcf_blur1d's row count, mcf_transposeXY/XZ's
+       `z*nx*ny` offset) use int row products, so a larger-but-valid volume would
+       overflow them. One boundary check here; no per-loop checks below. */
+    if (nvox3D > (size_t)INT_MAX) {
+        fprintf(stderr, "mcf_smooth_gauss: nx*ny*nz (%zu) exceeds INT_MAX\n", nvox3D);
+        return 1;
+    }
+    if (sigX_mm <= 0.0f && sigY_mm <= 0.0f && sigZ_mm <= 0.0f) return 0;
+#if defined(_OPENMP)
+    int parallel = (omp_get_max_threads() > 1);
+#else
+    int parallel = 0;
+#endif
+    /* Blur X: rows are already contiguous. */
+    if (sigX_mm > 0.0f && nx >= 2) {
+        size_t nRow = (size_t)ny * nz;
+        if (mcf_blur1d(data, nx, (int)nRow, dx, sigX_mm, kernelWid, parallel)) return 1;
+    }
+    /* Blur Y: transpose XY, blur leading (now Y) dim, transpose back. */
+    if (sigY_mm > 0.0f && ny >= 2) {
+        float *t = (float *)malloc(nvox3D * sizeof(float));
+        if (!t) return 1;
+        int tx = nx, ty = ny;
+        mcf_transposeXY(data, t, &tx, &ty, nz);          /* t is ny*nx*nz */
+        int rc = mcf_blur1d(t, ny, nx * nz, dy, sigY_mm, kernelWid, parallel);
+        int bx = ny, by = nx;
+        mcf_transposeXY(t, data, &bx, &by, nz);          /* back to nx*ny*nz */
+        free(t);
+        if (rc) return 1;
+    }
+    /* Blur Z: transpose XZ, blur leading (now Z) dim, transpose back. */
+    if (sigZ_mm > 0.0f && nz >= 2) {
+        float *t = (float *)malloc(nvox3D * sizeof(float));
+        if (!t) return 1;
+        int tx = nx, tz = nz;
+        mcf_transposeXZ(data, t, &tx, ny, &tz);          /* t is nz*ny*nx */
+        int rc = mcf_blur1d(t, nz, nx * ny, dz, sigZ_mm, kernelWid, parallel);
+        int bx = nz, bz = nx;
+        mcf_transposeXZ(t, data, &bx, ny, &bz);          /* back to nx*ny*nz */
+        free(t);
+        if (rc) return 1;
+    }
     return 0;
 }

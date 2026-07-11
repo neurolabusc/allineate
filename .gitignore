@@ -1,6 +1,7 @@
 # Executables
 allineate
 allineate.baseline
+/test_capi_nullopts
 
 # Object files
 *.o
@@ -21,9 +22,16 @@ audit*.md
 *.swo
 *~
 
-# Benchmark suite — kept local for now (some edge-case inputs contain
-# non-shareable facial information). Intend to add a shareable subset later.
-benchmark/
+# Benchmark inputs/templates/masks are tracked (shareable). Only the regenerable
+# registration outputs are ignored.
+benchmark/outputs/
 
 # Python cache
 __pycache__/
+
+# Stray root registration outputs (test artifacts; regenerable)
+/*.nii.gz
+/*.nii
+
+# Reference papers (kept locally, not tracked)
+flirt.pdf

@@ -18,7 +18,7 @@
 # the optimization penalty at build time is negligible next to the run time.
 
 CNAME ?= clang
-SRC    = main.c allineate.c nifti_io.c powell_newuoa.c miniCoreFLT.c
+SRC    = main.c allineate.c nifti_io.c powell_newuoa.c miniCoreFLT.c coreg_fast.c
 OUT    = allineate
 
 # zlib is required; zstd is optional and experimental (ZSTD=1).
@@ -65,21 +65,34 @@ all:
 # Deterministic correctness gate: builds synthetic (non-facial) fixtures and asserts
 # the geometry/preprocessing/affine paths. Exits nonzero on any failure, so CI or a
 # release script can gate on it. Needs python3 + numpy + nibabel.
+# The C-API harness links the estimator WITHOUT main.c to exercise coreg_fast_estimate()
+# with NULL opts (the default-options contract) — a path the CLI never takes. Built here so
+# `make test` also gates it; test_regression.py (§12) generates fixtures and runs it.
+CAPI_OUT = test_capi_nullopts
 test: all
+	$(CNAME) $(CFLAGS) $(OMPFLAGS) $(ZFLAGS) -I. test/test_capi_nullopts.c \
+		allineate.c nifti_io.c powell_newuoa.c miniCoreFLT.c coreg_fast.c \
+		$(ZLIB) $(OMPLINK) -lm -o $(CAPI_OUT)
 	python3 test/test_regression.py --allineate ./$(OUT)
+	python3 test/test_coreg_fast.py
 
-# AddressSanitizer build for heap-overflow / use-after-free testing (NOT leaks on
-# Apple Silicon — see the LeakSanitizer note below).
-# Built WITHOUT OpenMP: libomp's thread pool retains allocations that show up as
-# noise, and ASan is far slower on the parallel interpolation paths.
-# NOTE (Apple Silicon macOS): LeakSanitizer is unavailable, so ASan here catches
+# AddressSanitizer build for heap-overflow / use-after-free testing.
+#
+# BUILT WITHOUT OpenMP ON PURPOSE — DO NOT ADD $(OMPFLAGS)/$(OMPLINK) HERE.
+# On Apple Silicon macOS with Apple Clang, `-fsanitize=address` + Homebrew libomp
+# HARD-DEADLOCKS at libomp's runtime init (verified: even a trivial `#pragma omp
+# parallel for` hangs). `OMP_NUM_THREADS=1` does NOT help — the hang is at library
+# load, before any parallel region. Omitting the OpenMP flags makes `#pragma omp`
+# a no-op so ASan runs serial (slower, but it actually runs). The alternative is to
+# build ASan with Homebrew LLVM clang instead of Apple Clang
+# (CNAME=/opt/homebrew/opt/llvm/bin/clang), whose ASan+OpenMP works.
+#
+# LEAKS: LeakSanitizer is unavailable on Apple Silicon, so ASan here catches
 # heap-overflow / use-after-free but NOT leaks. For leak detection use Xcode's
-# `leaks` tool on a PLAIN (non-ASan) binary — running `leaks` against an ASan build
-# is not the right workflow. The optimized `make` binary works well, e.g.:
+# `leaks` tool on a PLAIN (non-ASan) binary — not an ASan build:
 #     make
 #     MallocNanoZone=0 leaks --atExit -- ./allineate <moving> <stationary> out.nii.gz
-# (a plain `-O0 -g` build also works and is easier to symbolicate). ASan is slow on
-# full-size volumes (the optimizer runs many interpolation trials); test small.
+# ASan is slow on full-size volumes (many interpolation trials); test small.
 sanitize debug: $(SRC)
 	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=address -fno-omit-frame-pointer \
 		$(ZFLAGS) $(SRC) $(ZLIB) -lm -o $(OUT)
@@ -89,4 +102,4 @@ profile: $(SRC)
 	$(CNAME) $(CFLAGS) $(OMPFLAGS) $(ZFLAGS) -DAL_PROFILE $(SRC) $(ZLIB) $(OMPLINK) -lm -o $(OUT)
 
 clean:
-	rm -f $(OUT) allineate.baseline *.o
+	rm -f $(OUT) allineate.baseline test_capi_nullopts *.o

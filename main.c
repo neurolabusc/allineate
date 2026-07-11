@@ -10,6 +10,7 @@
 #include "nifti_io.h"
 #include "allineate.h"
 #include "miniCoreFLT.h"
+#include "coreg_fast.h"
 #if defined(_OPENMP)
 	#include <omp.h>
 #endif
@@ -49,7 +50,16 @@ int show_help( void ) {
 	printf(" <moving> <stationary> [opts] <output>: co-register the moving image match the stationary image\n");
 	printf(" <moving> [opts] <output>            : preprocess only (e.g. -robustfov), no registration\n");
 	printf("                 Use '-' for <moving> to read from stdin, '-' for <output> to write to stdout\n");
-	printf("                 opts: -cost XX (hel,lpc,lpa,ls) -cmass -nocmass -source_automask\n");
+	printf("                 opts: -cost XX  cost function / engine:\n");
+	printf("                                 allineate engine: hel (Hellinger, default), lpc, lpa, ls;\n");
+	printf("                                 fast engine (lower RAM, 12-DOF): 'fast'\n");
+	printf("                                 (Hellinger — robust cross-modal, recommended) or 'fastcr'\n");
+	printf("                                 (correlation-ratio — unstable when modalities\n");
+	printf("                                 differ). The fast engine has a fixed config: -warp/-interp/\n");
+	printf("                                 -source_automask/-dark_automask/-sym/-zoom/-skullstrip are\n");
+	printf("                                 not supported with it (-final sets output interp; -cmass/\n");
+	printf("                                 -nocmass select COM vs header-only seeding).\n");
+	printf("                       -cmass -nocmass -source_automask\n");
 	printf("                       -dark_automask  ignore matched pairs where either image is at its\n");
 	printf("                                 darkest value (background/zero-pad); uses each image's own\n");
 	printf("                                 minimum so it is safe for signed data (e.g. CT Hounsfield).\n");
@@ -72,6 +82,9 @@ int show_help( void ) {
 	printf("                       -applymat in.json  reslice the moving image onto the stationary (target)\n");
 	printf("                                 grid using a saved matrix (no registration). The target may have any\n");
 	printf("                                 resolution/FOV/origin sharing the fixed world frame. -final sets interp.\n");
+	printf("                       -master grid.nii  register at the stationary resolution, but reslice the\n");
+	printf("                                 output onto THIS grid (e.g. a higher-res template sharing the\n");
+	printf("                                 stationary world frame). Works with both engines. -final sets interp.\n");
 	printf("                       -com  set the origin to the brightness center of mass (header-only\n");
 	printf("                                 translation of the affine); a cheap centered start for\n");
 	printf("                                 symmetric images. Runs after -robustfov, before -sym.\n");
@@ -101,6 +114,33 @@ int show_help( void ) {
 
 /* Finalize output: for stdout, force single-file NIfTI-1 and set names to "-";
    otherwise set the output filename. Then write. Returns 0 on success. */
+/* Deep-copy the header + voxel data of a nifti_image (the fields the affine reslice and
+   writer read: dims, sform/qform, pixdim, and the data buffer). Filenames and extensions
+   are dropped — the writer sets a fresh output name — so nifti_image_free() on the copy
+   frees only its own data. Used by -master to preserve the moving image as it enters the
+   allineate engine (which reslices it in place) so it can be re-resliced onto the master
+   grid afterward. Returns a malloc'd image (free with nifti_image_free) or NULL. */
+static nifti_image *nim_deep_copy(const nifti_image *s) {
+	if (!s || !s->data) return NULL;
+	nifti_image *d = (nifti_image *)malloc(sizeof *d);
+	if (!d) return NULL;
+	*d = *s;                     /* copies all scalar/array header fields (dims, sto/qto, pixdim) */
+	d->fname = NULL; d->iname = NULL;    /* owned by the source; the writer sets fresh names */
+	d->num_ext = 0;  d->ext_list = NULL; /* drop extensions (not needed for the resliced output) */
+	size_t nbytes = (size_t)s->nvox * s->nbyper;
+	d->data = malloc(nbytes ? nbytes : 1);
+	if (!d->data) { free(d); return NULL; }
+	memcpy(d->data, s->data, nbytes);
+	return d;
+}
+
+/* Resolve the OUTPUT-warp interpolation: -final if set, else the mode default (cubic). This
+   is the documented default→cubic rule (see allineate.h AL_INTERP_DEFAULT); shared by the
+   -applymat, fast-engine, and -master reslice sites so the default lives in one place. */
+static int resolve_output_interp(const al_opts *o) {
+	return (o->final_interp == AL_INTERP_DEFAULT) ? AL_INTERP_CUBIC : o->final_interp;
+}
+
 static int write_result(nifti_image *out, const char *output_name, int isStdOut) {
 	if (isStdOut) {
 		free(out->fname); out->fname = nifti_strdup("-");
@@ -150,7 +190,8 @@ static void json_mat44(FILE *f, mat44 m, const char *key) {
 /* Save the fitted registration affine (from nii_last_affine()) as self-describing
    JSON. `fwd` is the world-space FIXED(base)->MOVING(source) "pull" transform.
    Returns 0 on success. */
-static int write_affine_json(const char *path, mat44 fwd, al_opts opts,
+static int write_affine_json(const char *path, mat44 fwd, const char *engine,
+                             int dof, const char *cost_name,
                              const char *fixed_name, const char *moving_name) {
 	FILE *f = fopen(path, "w");
 	if (!f) { fprintf(stderr, "Failed to open '%s' for -savemat\n", path); return 1; }
@@ -160,8 +201,9 @@ static int write_affine_json(const char *path, mat44 fwd, al_opts opts,
 	fprintf(f, "  \"version\": 1,\n");
 	fprintf(f, "  \"space\": \"world\",\n");
 	fprintf(f, "  \"units\": \"mm\",\n");
-	fprintf(f, "  \"dof\": %d,\n", opts.warp);
-	fprintf(f, "  \"cost\": "); json_str(f, al_cost_name(opts.cost)); fprintf(f, ",\n");
+	fprintf(f, "  \"engine\": "); json_str(f, engine); fprintf(f, ",\n");
+	fprintf(f, "  \"dof\": %d,\n", dof);
+	fprintf(f, "  \"cost\": "); json_str(f, cost_name); fprintf(f, ",\n");
 	fprintf(f, "  \"fixed\": "); json_str(f, fixed_name ? fixed_name : ""); fprintf(f, ",\n");
 	fprintf(f, "  \"moving\": "); json_str(f, moving_name ? moving_name : ""); fprintf(f, ",\n");
 	fprintf(f, "  \"comment\": \"fixed_to_moving maps FIXED (stationary) world-mm to MOVING "
@@ -239,19 +281,19 @@ static int al_parse_subopts(int *ac, int argc, char **argv, al_opts *opts,
 			fprintf(stderr, " + -p ignored: built without OpenMP (single-threaded)\n");
 #endif
 		} else if (!strcmp(argv[*ac], "-cmass")) {
-			opts->cmass = AL_CMASS_YES;
+			opts->cmass = AL_CMASS_YES; opts->cli_set |= AL_CLI_CMASS;
 		} else if (!strcmp(argv[*ac], "-nocmass")) {
-			opts->cmass = AL_CMASS_NONE;
+			opts->cmass = AL_CMASS_NONE; opts->cli_set |= AL_CLI_CMASS;
 		} else if (!strcmp(argv[*ac], "-source_automask")) {
 			opts->source_automask = 1;
 		} else if (!strcmp(argv[*ac], "-dark_automask")) {
 			opts->dark_automask = 1;
 		} else if (!strcmp(argv[*ac], "-nearest") || !strcmp(argv[*ac], "-NN")) {
-			opts->final_interp = AL_INTERP_NN;
+			opts->final_interp = AL_INTERP_NN; opts->cli_set |= AL_CLI_FINAL;
 		} else if (!strcmp(argv[*ac], "-linear") || !strcmp(argv[*ac], "-trilinear")) {
-			opts->final_interp = AL_INTERP_LINEAR;
+			opts->final_interp = AL_INTERP_LINEAR; opts->cli_set |= AL_CLI_FINAL;
 		} else if (!strcmp(argv[*ac], "-cubic") || !strcmp(argv[*ac], "-tricubic")) {
-			opts->final_interp = AL_INTERP_CUBIC;
+			opts->final_interp = AL_INTERP_CUBIC; opts->cli_set |= AL_CLI_FINAL;
 		} else if (!strcmp(argv[*ac], "-warp")) {
 			(*ac)++;
 			if (*ac >= argc) {
@@ -262,6 +304,7 @@ static int al_parse_subopts(int *ac, int argc, char **argv, al_opts *opts,
 				fprintf(stderr, "Unknown warp '%s' (use: sho, shr, srs, aff)\n", argv[*ac]);
 				return 1;
 			}
+			opts->cli_set |= AL_CLI_WARP;
 		} else if (!strcmp(argv[*ac], "-interp")) {
 			(*ac)++;
 			if (*ac >= argc) {
@@ -272,6 +315,7 @@ static int al_parse_subopts(int *ac, int argc, char **argv, al_opts *opts,
 				fprintf(stderr, "Unknown interp '%s' (use: NN, linear, cubic)\n", argv[*ac]);
 				return 1;
 			}
+			opts->cli_set |= AL_CLI_INTERP;
 		} else if (!strcmp(argv[*ac], "-final")) {
 			(*ac)++;
 			if (*ac >= argc) {
@@ -282,6 +326,7 @@ static int al_parse_subopts(int *ac, int argc, char **argv, al_opts *opts,
 				fprintf(stderr, "Unknown final interp '%s' (use: NN, linear, cubic)\n", argv[*ac]);
 				return 1;
 			}
+			opts->cli_set |= AL_CLI_FINAL;
 		} else if (!strcmp(argv[*ac], "-skullstrip")) {
 			(*ac)++;
 			if (*ac >= argc) {
@@ -303,6 +348,13 @@ static int al_parse_subopts(int *ac, int argc, char **argv, al_opts *opts,
 				return 1;
 			}
 			opts->applymat = argv[*ac];
+		} else if (!strcmp(argv[*ac], "-master")) {
+			(*ac)++;
+			if (*ac >= argc) {
+				fprintf(stderr, "%s -master requires an output-grid image filename\n", cmd_name);
+				return 1;
+			}
+			opts->master = argv[*ac];
 		} else if (!strcmp(argv[*ac], "-com")) {
 			opts->com = 1;
 		} else if (!strcmp(argv[*ac], "-sym")) {
@@ -314,6 +366,15 @@ static int al_parse_subopts(int *ac, int argc, char **argv, al_opts *opts,
 		} else if (!strcmp(argv[*ac], "-symb")) {
 			opts->sym = 1;
 			opts->sym_deoblique = 2;   /* auto-compete: best of -sym / -symd */
+		} else if (!strcmp(argv[*ac], "-fast") || !strcmp(argv[*ac], "-fasthel")) {
+			fprintf(stderr, "%s: -fast/-fasthel were replaced by cost selectors — use "
+			                "'-cost fast' (fast engine, Hellinger; robust cross-modal) or "
+			                "'-cost fastcr' (fast engine, correlation-ratio)\n", cmd_name);
+			return 1;
+		} else if (!strcmp(argv[*ac], "-coreg")) {
+			fprintf(stderr, "%s: -coreg was replaced by '-cost fast' "
+			                "(allineate is the default; '-cost fast' for the fast engine)\n", cmd_name);
+			return 1;
 		} else if (!strcmp(argv[*ac], "-nosagseed")) {
 			opts->sagseed = 0;
 		} else if (!strcmp(argv[*ac], "-zoom")) {
@@ -339,9 +400,19 @@ static int al_parse_subopts(int *ac, int argc, char **argv, al_opts *opts,
 				fprintf(stderr, "%s -cost requires a cost function name\n", cmd_name);
 				return 1;
 			}
-			if (al_parse_cost(argv[*ac], &opts->cost)) {
-				fprintf(stderr, "Unknown cost function '%s' (use: lpc, lpa, hel, ls)\n", argv[*ac]);
+			/* Two -cost values select the FAST engine instead of an allineate cost:
+			   'fast' = fast path, Hellinger (robust cross-modal); 'fastcr' = fast path,
+			   correlation-ratio (unstable when modalities differ; for same-modality/synthetic use). They set the
+			   engine, not an allineate cost, so they do NOT set AL_CLI_COST. */
+			if (!strcmp(argv[*ac], "fast")) {
+				opts->fast = AL_ENGINE_FAST_HEL;
+			} else if (!strcmp(argv[*ac], "fastcr")) {
+				opts->fast = AL_ENGINE_FAST_CR;
+			} else if (al_parse_cost(argv[*ac], &opts->cost)) {
+				fprintf(stderr, "Unknown cost function '%s' (use: fast, fastcr, lpc, lpa, hel, ls)\n", argv[*ac]);
 				return 1;
+			} else {
+				opts->cli_set |= AL_CLI_COST;
 			}
 		} else {
 			(*ac)--;
@@ -403,6 +474,10 @@ int main(int argc, char * argv[]) {
 		fprintf(stderr, "The -skullstrip brain mask must be a file, not stdin ('-')\n");
 		return 1;
 	}
+	if (opts.master && opts.master[0] == '-' && opts.master[1] == '\0') {
+		fprintf(stderr, "The -master output grid must be a file, not stdin ('-')\n");
+		return 1;
+	}
 	/* -sym has no defined meaning with -skullstrip: skullstrip's registration base
 	   is the moving image used as a template, and seeding its header with an MSP
 	   correction would silently move the mask target. Reject rather than ignore. */
@@ -420,6 +495,43 @@ int main(int argc, char * argv[]) {
 		fprintf(stderr, "-savemat requires a <stationary> image to register against\n");
 		return 1;
 	}
+	/* The fast engine (-cost fast/-cost fastcr) is a distinct estimator: it needs a
+	   stationary image and does not (yet) compose with the -sym/-zoom/-skullstrip
+	   header-seed workflow. */
+	if (opts.fast) {
+		const char *fflag = (opts.fast == AL_ENGINE_FAST_HEL) ? "-cost fast" : "-cost fastcr";
+		if (!stationary_name && !opts.applymat) {
+			fprintf(stderr, "%s requires a <stationary> image to register against\n", fflag);
+			return 1;
+		}
+		if (opts.skullstrip || opts.sym || opts.zoom) {
+			fprintf(stderr, "%s cannot be combined with -skullstrip/-sym/-zoom\n", fflag);
+			return 1;
+		}
+		/* The fast engine has a FIXED configuration (the cost is chosen by the selector —
+		   correlation-ratio for '-cost fastcr', Hellinger for '-cost fast' — 12-DOF affine, its
+		   own matching interpolation, its own internal COM seeding). Reject allineate tuning options
+		   the user explicitly passed rather than silently ignoring them (an ignored option would
+		   also make -savemat metadata misleading). Only -final (output interpolation) and
+		   operational flags (-p, -savemat, -robustfov, -com) apply to the fast path. */
+		if (opts.cli_set & (AL_CLI_COST | AL_CLI_WARP)) {
+			fprintf(stderr, "%s uses a fixed cost function and 12-DOF affine; "
+			                "-warp and a further allineate -cost are not supported with it\n", fflag);
+			return 1;
+		}
+		if (opts.cli_set & AL_CLI_INTERP) {
+			fprintf(stderr, "%s ignores -interp (matching interpolation is fixed); "
+			                "use -final to set the OUTPUT interpolation\n", fflag);
+			return 1;
+		}
+		/* -cmass/-nocmass ARE honored: the fast engine always competes a header seed
+		   against a COM-translation seed. -cmass affirms that default; -nocmass drops
+		   the COM seed (header-only start). Wired into cfo.use_cmass below. */
+		if (opts.source_automask || opts.dark_automask) {
+			fprintf(stderr, "%s does not support -source_automask/-dark_automask\n", fflag);
+			return 1;
+		}
+	}
 	/* -applymat is a standalone apply mode: reslice the moving image onto the
 	   stationary (target) grid using a saved world-space matrix; it does NO
 	   registration, so it is exclusive with the registration/preprocessing modes. */
@@ -428,8 +540,34 @@ int main(int argc, char * argv[]) {
 			fprintf(stderr, "-applymat requires a <target> image (it defines the output grid)\n");
 			return 1;
 		}
-		if (opts.savemat || opts.skullstrip || opts.sym || opts.com || opts.robustfov > 0.0) {
-			fprintf(stderr, "-applymat cannot be combined with registration/preprocessing options\n");
+		if (opts.fast || opts.savemat || opts.skullstrip || opts.sym || opts.com || opts.robustfov > 0.0) {
+			fprintf(stderr, "-applymat does no registration; it cannot be combined with "
+			                "-cost fast/-cost fastcr/-savemat/-skullstrip/-sym/-com/-robustfov\n");
+			return 1;
+		}
+		if ((opts.cli_set & (AL_CLI_COST | AL_CLI_WARP | AL_CLI_INTERP | AL_CLI_CMASS)) ||
+		    opts.source_automask || opts.dark_automask) {
+			fprintf(stderr, "-applymat ignores registration options "
+			                "(-cost/-warp/-interp/-cmass/-source_automask/-dark_automask); "
+			                "only -final sets the output interpolation\n");
+			return 1;
+		}
+	}
+	/* -master: register at the stationary resolution but reslice the result onto a
+	   different (typically higher-res) grid that shares the stationary world frame.
+	   It needs a real registration (moving+stationary) and an output image. -applymat
+	   already takes its own <target> grid, and -skullstrip has fixed output semantics. */
+	if (opts.master) {
+		if (!stationary_name) {
+			fprintf(stderr, "-master needs a <stationary> image (it reslices a registration result)\n");
+			return 1;
+		}
+		if (opts.applymat || opts.skullstrip) {
+			fprintf(stderr, "-master is not supported with -applymat/-skullstrip\n");
+			return 1;
+		}
+		if (!output_name) {
+			fprintf(stderr, "-master produces an output image; provide an output filename\n");
 			return 1;
 		}
 	}
@@ -539,7 +677,7 @@ int main(int argc, char * argv[]) {
 		if (read_affine_json(opts.applymat, &ftm)) {
 			nifti_image_free(moving); nifti_image_free(stationary); goto cleanup;
 		}
-		int interp = (opts.final_interp == AL_INTERP_DEFAULT) ? AL_INTERP_CUBIC : opts.final_interp;
+		int interp = resolve_output_interp(&opts);
 		if (nii_apply_affine(moving, stationary, ftm, interp, 0.0f)) {
 			fprintf(stderr, "-applymat failed on '%s'\n", moving_name);
 			nifti_image_free(moving); nifti_image_free(stationary); goto cleanup;
@@ -575,6 +713,65 @@ int main(int argc, char * argv[]) {
 			goto cleanup;
 		}
 		nifti_image_free(stationary);
+	} else if (opts.fast) {
+		/* Fast SPM/FLIRT-inspired affine path (-cost fast / -cost fastcr). Estimates a world-mm
+		   FIXED->MOVING affine without mutating the inputs, then reslices the moving
+		   image onto the stationary grid once. Result-based -savemat. */
+		coreg_fast_opts cfo = coreg_fast_opts_default();
+		cfo.cost = (opts.fast == AL_ENGINE_FAST_HEL) ? CF_COST_HEL   /* -cost fast:   Hellinger */
+		                                             : CF_COST_CR;   /* -cost fastcr: correlation-ratio */
+		/* -nocmass forces the header-only seed; default (and -cmass) keeps the COM seed. */
+		cfo.use_cmass = !((opts.cli_set & AL_CLI_CMASS) && opts.cmass == AL_CMASS_NONE);
+		coreg_fast_result res;
+		if (coreg_fast_estimate(moving, stationary, &cfo, &res)) {
+			fprintf(stderr, "Fast registration failed\n");
+			nifti_image_free(moving); nifti_image_free(stationary);
+			goto cleanup;
+		}
+		fprintf(stderr, "Fast registration: %d levels, %d evals, cost=%.5f, %.0f ms\n",
+			res.levels_completed, res.evaluations, res.final_cost, res.registration_ms);
+		/* Only reslice the moving image if an output image is requested. Matrix-only
+		   mode (-savemat with no output) skips the full-resolution warp entirely — it
+		   costs time/memory and an unused reslice failure must not fail a valid save. */
+		if (output_name) {
+			int interp = resolve_output_interp(&opts);
+			/* -master: reslice onto the given grid (not the stationary grid). The fast
+			   engine leaves `moving` unmutated, so no copy is needed — just target the
+			   master grid with the same world-mm transform. */
+			nifti_image *grid = stationary;
+			nifti_image *master = NULL;
+			if (opts.master) {
+				master = nifti_image_read(opts.master, 1);
+				if (!master) {
+					fprintf(stderr, "Failed to read -master grid '%s'\n", opts.master);
+					nifti_image_free(moving); nifti_image_free(stationary);
+					goto cleanup;
+				}
+				grid = master;
+			}
+			int arc = nii_apply_affine(moving, grid, res.fixed_to_moving, interp, 0.0f);
+			if (master) nifti_image_free(master);
+			if (arc) {
+				fprintf(stderr, "Fast registration final reslice failed\n");
+				nifti_image_free(moving); nifti_image_free(stationary);
+				goto cleanup;
+			}
+		}
+		nifti_image_free(stationary);
+		if (output_name && write_result(moving, output_name, isStdOut)) {
+			nifti_image_free(moving); goto cleanup;
+		}
+		/* Record the validated fast-engine configuration actually used. */
+		const char *fast_cost = (res.resolved_cost == CF_COST_LS) ? "ls" :
+		                        (res.resolved_cost == CF_COST_HEL) ? "hel" : "cr";
+		if (opts.savemat &&
+		    write_affine_json(opts.savemat, res.fixed_to_moving, "coreg_fast", res.resolved_dof,
+		                      fast_cost, stationary_name, moving_name)) {
+			fprintf(stderr, "Failed to save affine to '%s'\n", opts.savemat);
+			nifti_image_free(moving); goto cleanup;
+		}
+		if (opts.savemat) fprintf(stderr, " + Saved affine to '%s'\n", opts.savemat);
+		nifti_image_free(moving);
 	} else {
 		/* Optional -sym pre-step: fold the midsagittal correction into the moving
 		   image header as an initial estimate before registering to the template. */
@@ -601,13 +798,45 @@ int main(int argc, char * argv[]) {
 				goto cleanup;
 			}
 		}
+		/* -master: nii_allineate reslices `moving` in place onto the stationary grid, so
+		   preserve the moving image AS IT ENTERS the fit (after any -sym/-com/-robustfov
+		   pre-steps — the fitted matrix is relative to that seeded header). After the fit
+		   we re-reslice this copy onto the master grid with the same transform. */
+		nifti_image *master_out = NULL;
+		if (opts.master) {
+			master_out = nim_deep_copy(moving);
+			if (!master_out) {
+				fprintf(stderr, "-master: failed to copy the moving image\n");
+				nifti_image_free(moving); nifti_image_free(stationary);
+				goto cleanup;
+			}
+		}
 		/* Normal registration mode */
 		int ret = nii_allineate(moving, stationary, opts);
 		nifti_image_free(stationary);
 		if (ret) {
 			fprintf(stderr, "Registration failed\n");
 			nifti_image_free(moving);
+			if (master_out) nifti_image_free(master_out);
 			goto cleanup;
+		}
+		if (opts.master) {
+			/* Reslice the preserved pre-fit moving onto the master grid using the fitted
+			   affine, then make it the image we write/return. The saved matrix is still the
+			   stationary-frame transform (unchanged by the output grid). */
+			mat44 aff;
+			int interp = resolve_output_interp(&opts);
+			nifti_image *grid = nifti_image_read(opts.master, 1);
+			if (!grid || nii_last_affine(&aff) ||
+			    nii_apply_affine(master_out, grid, aff, interp, 0.0f)) {
+				fprintf(stderr, "-master reslice onto '%s' failed\n", opts.master);
+				if (grid) nifti_image_free(grid);
+				nifti_image_free(master_out); nifti_image_free(moving);
+				goto cleanup;
+			}
+			nifti_image_free(grid);
+			nifti_image_free(moving);   /* discard the stationary-grid result */
+			moving = master_out;        /* write_result/-savemat below operate on `moving` */
 		}
 		/* Write the registered image first (the primary deliverable), then the
 		   -savemat JSON — so a failed image write never leaves a stale matrix
@@ -619,7 +848,8 @@ int main(int argc, char * argv[]) {
 		if (opts.savemat) {
 			mat44 aff;
 			if (nii_last_affine(&aff) ||
-			    write_affine_json(opts.savemat, aff, opts, stationary_name, moving_name)) {
+			    write_affine_json(opts.savemat, aff, "allineate", opts.warp,
+			                      al_cost_name(opts.cost), stationary_name, moving_name)) {
 				fprintf(stderr, "Failed to save affine to '%s'\n", opts.savemat);
 				nifti_image_free(moving);
 				goto cleanup;
