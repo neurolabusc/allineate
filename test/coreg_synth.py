@@ -54,6 +54,7 @@ CAPTURE_CASES = {
     "identity":      np.eye(4),
     "trans_x":       _trans(30, 0, 0),
     "trans_xyz":     _trans(18, -22, 14),
+    "trans_large_y": _trans(0, 80, 0),
     "rot_x":         _rot(0, 30),
     "rot_z":         _rot(2, -25),
     "rot_xyz":       _rot(0, 12) @ _rot(1, -15) @ _rot(2, 20),

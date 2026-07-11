@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Synthetic capture-range test for the fast path (-cost fastcr).
+"""Synthetic capture-range and partial-FOV tests for the fast path.
 
 For each known world affine A (FIXED->MOVING) in coreg_synth.CAPTURE_CASES we build a
 moving image whose voxel content equals a generated asymmetric phantom but whose header world
 matrix is A @ S_fixed. The true FIXED->MOVING transform is then exactly A, so the fast
 path must recover F2M with ERMS(F2M, A) <= floor over a 100 mm sphere.
+
+The partial-FOV cases crop one end of the moving acquisition while preserving its
+world coordinates. The true transform remains identity; the fit must not distort
+the affine merely to pull unavailable fixed anatomy inside the moving grid.
 """
 import os, sys, json, subprocess, tempfile, shutil
 import numpy as np, nibabel as nib
@@ -56,6 +60,29 @@ def run_case(name, A, fixed, tmp):
     return cs.erms(M, A), None
 
 
+def run_partial_fov(cost, fixed, tmp):
+    """Crop 32 mm from one moving-grid edge without changing world-space anatomy."""
+    fx = nib.load(fixed)
+    data = np.asarray(fx.dataobj, dtype=np.float32)
+    cut = 16
+    Sm = fx.affine.astype(np.float64)
+    Sm[:3, 3] += Sm[:3, 2] * cut
+    mov = nib.Nifti1Image(data[:, :, cut:], Sm)
+    mov.set_sform(Sm, code=1); mov.set_qform(Sm, code=0)
+    mp = os.path.join(tmp, f"mov_partial_{cost}.nii.gz")
+    jp = os.path.join(tmp, f"m_partial_{cost}.json")
+    nib.save(mov, mp)
+    cmd = [BIN, mp, fixed, "-cost", cost, "-savemat", jp]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return None, "timeout (>120s)"
+    if r.returncode != 0 or not os.path.exists(jp):
+        return None, r.stderr.strip()
+    M = np.array(json.load(open(jp))["fixed_to_moving"], dtype=np.float64)
+    return cs.erms(M, np.eye(4)), None
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="cf_synth_")
     try:
@@ -65,6 +92,14 @@ def main():
         for name, A in cs.CAPTURE_CASES.items():
             floor = cs.ERMS_IDENTITY_FLOOR_MM if name == "identity" else cs.ERMS_FLOOR_MM
             e, err = run_case(name, A, fixed, tmp)
+            if e is None:
+                print(f"{name:14s}   ---      {floor:.2f}   FAIL ({err[:50]})"); nfail += 1; continue
+            ok = e <= floor
+            print(f"{name:14s}  {e:7.3f}   {floor:.2f}   {'PASS' if ok else 'FAIL'}")
+            npass += ok; nfail += (not ok)
+        for cost, floor in (("fastcr", 0.10), ("fast", 1.00)):
+            name = f"partial_{cost}"
+            e, err = run_partial_fov(cost, fixed, tmp)
             if e is None:
                 print(f"{name:14s}   ---      {floor:.2f}   FAIL ({err[:50]})"); nfail += 1; continue
             ok = e <= floor

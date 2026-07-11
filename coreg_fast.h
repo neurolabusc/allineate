@@ -30,11 +30,12 @@
 
 typedef struct {
     int cost;          /* CF_COST_* (default CF_COST_HEL) */
-    int coarse_search; /* 1 = bounded deterministic orientation/scale seed search
-                          (default); 0 = header/COM local descent only */
+    int coarse_search; /* 1 = bounded deterministic orientation/scale search after
+                          initialization selection (default); 0 = local descent only */
     int max_dof;       /* highest DOF to fit: 6/7/9/12 (default 12) */
-    int use_cmass;     /* 1 = also seed the coarse search with a center-of-mass translation
-                          (default; -cmass affirms it); 0 = header-only seed (-nocmass) */
+    int use_cmass;     /* 1 = auto-select supplied-affine vs COM-recentered initialization
+                          from initial dependence*overlap (default); 0 = use the
+                          supplied frame only (-nocmass, or an already-applied -com) */
     int verbose;       /* nonzero: per-stage logging to stderr */
     /* NOTE: the final reslice/interpolation is applied by the CALLER (main.c), not the
        estimator, so there is no interp field here — coreg_fast_estimate() only returns
@@ -57,7 +58,7 @@ static inline coreg_fast_opts coreg_fast_opts_default(void) {
                                '-cost fastcr' selects CF_COST_CR explicitly */
     o.coarse_search = 1;
     o.max_dof = 12;
-    o.use_cmass = 1;   /* COM seed on by default (competes with the header seed) */
+    o.use_cmass = 1;   /* auto-select supplied-affine vs COM initialization */
     o.verbose = 0;
     return o;
 }

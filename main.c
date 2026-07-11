@@ -57,8 +57,9 @@ int show_help( void ) {
 	printf("                                 (correlation-ratio — unstable when modalities\n");
 	printf("                                 differ). The fast engine has a fixed config: -warp/-interp/\n");
 	printf("                                 -source_automask/-dark_automask/-sym/-zoom/-skullstrip are\n");
-	printf("                                 not supported with it (-final sets output interp; -cmass/\n");
-	printf("                                 -nocmass select COM vs header-only seeding).\n");
+	printf("                                 not supported with it (-final sets output interp; default/\n");
+	printf("                                 -cmass auto-select initialization, -com forces COM,\n");
+	printf("                                 -nocmass forces the supplied affine).\n");
 	printf("                       -cmass -nocmass -source_automask\n");
 	printf("                       -dark_automask  ignore matched pairs where either image is at its\n");
 	printf("                                 darkest value (background/zero-pad); uses each image's own\n");
@@ -524,9 +525,10 @@ int main(int argc, char * argv[]) {
 			                "use -final to set the OUTPUT interpolation\n", fflag);
 			return 1;
 		}
-		/* -cmass/-nocmass ARE honored: the fast engine always competes a header seed
-		   against a COM-translation seed. -cmass affirms that default; -nocmass drops
-		   the COM seed (header-only start). Wired into cfo.use_cmass below. */
+		/* Fast initialization overrides are honored. Plain mode selects between the
+		   supplied affine and a COM-recentered frame from their initial HEL/overlap
+		   score. -com has already recentered the header and forces that frame;
+		   -nocmass forces the supplied affine. Wired into cfo.use_cmass below. */
 		if (opts.source_automask || opts.dark_automask) {
 			fprintf(stderr, "%s does not support -source_automask/-dark_automask\n", fflag);
 			return 1;
@@ -720,8 +722,9 @@ int main(int argc, char * argv[]) {
 		coreg_fast_opts cfo = coreg_fast_opts_default();
 		cfo.cost = (opts.fast == AL_ENGINE_FAST_HEL) ? CF_COST_HEL   /* -cost fast:   Hellinger */
 		                                             : CF_COST_CR;   /* -cost fastcr: correlation-ratio */
-		/* -nocmass forces the header-only seed; default (and -cmass) keeps the COM seed. */
-		cfo.use_cmass = !((opts.cli_set & AL_CLI_CMASS) && opts.cmass == AL_CMASS_NONE);
+		/* -com and -nocmass are strict overrides; otherwise auto-select initialization. */
+		cfo.use_cmass = !opts.com &&
+		                 !((opts.cli_set & AL_CLI_CMASS) && opts.cmass == AL_CMASS_NONE);
 		coreg_fast_result res;
 		if (coreg_fast_estimate(moving, stationary, &cfo, &res)) {
 			fprintf(stderr, "Fast registration failed\n");

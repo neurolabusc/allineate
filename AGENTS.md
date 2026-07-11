@@ -46,7 +46,8 @@ defends via `al_mat44_usable`/`mc_dmat44_usable`); PIGZ `popen` (never in the de
 
 Second, explicitly-selected engine; the default stays allineate. Independent SPM/FLIRT-**inspired**
 clean-room implementation (never derived from `niimath/src/GPL/`). Hierarchical 8→4→2 mm pyramid,
-two-seed (header + COM) coarse search. **Costs (`CF_COST_*`):** default `HEL` (clean-room
+cheap overlap-aware affine-vs-COM initialization selection, then one coarse search. **Costs
+(`CF_COST_*`):** default `HEL` (clean-room
 Hellinger-affinity — Bhattacharyya coefficient of the joint 2D histogram vs its marginals,
 deterministic chunked reduction so `-p1==-pN` bit-identical); plus `CR` (correlation ratio) and `LS`
 (Pearson). HEL is far better than CR on real cross-modal images and is the default (CLI `-cost fast` =
@@ -64,10 +65,25 @@ serial-only (`g_cf` global). `make profile` prints per-level timing (zero releas
 - **Level dims cover the source FOV** (`ceil(n·vox/sep)`, not round). Bound the world-FOV product
   before the `int` cast (a finite-but-extreme sform/pixdim would be UB), and reject a level > 8× the
   source voxel count (a coarse-pixdim source up-sampled to isotropic can be ~8 GB while < INT_MAX).
-- **Overlap policy**: out-of-FOV fixed-foreground samples take the moving background value (anti
-  shrinking-overlap) — do NOT drop them.
-- **Two-seed search**: refine each seed independently, pick the winner by *refined* cost. Do NOT rank
-  pooled raw-cost candidates before refining (that was a wrong-basin bug).
+- **Partial-FOV overlap policy**: HEL/CR statistics use only fixed-foreground samples that map
+  inside the moving FOV. Treating an acquisition boundary as moving background biases a cropped
+  scan toward scale/shear transforms that pull unavailable anatomy into the grid (the FLIRT Fig-1
+  problem). A 10%/16-sample overlap floor still rejects degenerate fits. LS retains its historical
+  background fill. Keep the fixed 64-chunk reduction and skip out-of-FOV samples inside each chunk
+  so `-p1==-pN` remains bit-identical.
+- **Initialization selection is cheap and overlap-aware**: default mode scores the supplied-affine
+  and exact `-com` starts once at 8 mm, maximizing `(1 - cost) * covered_fixed_foreground`, then runs
+  the coarse orientation search and full descent for ONLY the winner. Do not multiply the minimized
+  cost by overlap (that rewards low overlap). `-com` is a strict already-recentered override and
+  `-nocmass` is a strict supplied-affine override; neither auto-selects. The initial MICCAI coverage
+  was FLAIR 74.0% affine vs 97.6% COM and T1 59.7% vs 96.2%; after coarse refinement, overlap alone
+  would incorrectly prefer the visually bad T1 affine branch (99.982% vs 99.954%), so selection must
+  retain the statistical-dependence term rather than maximize overlap alone.
+- **Translation guardrail is ±128 mm, not ±64 mm**: oblique/reoriented MICCAI FLAIR/T1 headers need
+  about 77–78 mm of rigid-equivalent translation and produce COM seeds around 85 mm. A ±64 mm bound
+  rejects the good seed before scoring, after which HEL can manufacture a low-overlap wrong rotation.
+  The coarse optimizer remains local around its seeds, so the wider fail-closed guardrail does not
+  expand the discrete search; `trans_large_y` regression-guards an 80 mm capture.
 - **Rigid coarse, scale later**: the 8 mm level fits RIGID (scale locked at identity); freeing scale
   there let CR collapse into a spurious ~1.2× isotropic-shrink basin on wide-FOV cross-modal inputs.
   Global scale enters at 4 mm via a discrete bracket ({0.78,0.9,1.0,1.12,1.3}) scored at the rigid
@@ -76,8 +92,9 @@ serial-only (`g_cf` global). `make profile` prints per-level timing (zero releas
 - **Audit-hardened invariants** (regression-guarded): (1) failure is atomic — `*result` written only
   after all levels + optimizer-ok + valid cost + affine validity; a degenerate fit returns nonzero and
   writes no `-savemat`. (2) rejects options it can't honor (`-cost/-warp/-interp/-source_automask/
-  -dark_automask`); `-final` is allowed and `-cmass`/`-nocmass` are honored (`-nocmass` sets
-  `use_cmass=0`, dropping the COM seed). (3) `-savemat` serializes the REAL resolved config, never
+  -dark_automask`); `-final` is allowed and initialization overrides are honored (`-com` arrives
+  already recentered with auto-selection disabled; `-nocmass` disables it in the supplied frame).
+  (3) `-savemat` serializes the REAL resolved config, never
   hardcoded defaults. (4) matrix-only (`-savemat`, no output) skips the reslice. (5) `cf_dims_ok`
   validates single-volume 3D on entry. (6) `cf_extract_float` scaling matches `nii_to_float`.
   (7) `max_dof` honored at every stage.

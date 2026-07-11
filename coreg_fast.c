@@ -74,9 +74,12 @@ static inline double cf_wtime(void) {
 #define CF_PS_SHEAR 0.01   /* shear per unit */
 
 /* Guardrails (normalized units), wider than the supported capture envelope so a
- * valid fit is never clipped; a fit landing on a guardrail is reported as failure. */
-static const double CF_LO[12] = { -64,-64,-64,  -80,-80,-80,  -45,-45,-45,  -22,-22,-22 };
-static const double CF_HI[12] = {  64, 64, 64,   80, 80, 80,   55, 55, 55,   22, 22, 22 };
+ * valid fit is never clipped; a fit landing on a guardrail is reported as failure.
+ * Translation needs more room than the nominal capture range: an oblique/reoriented
+ * but substantially overlapping head can require an 80+ mm COM seed. Rejecting that
+ * seed at 64 mm forces the search to mimic translation with a wrong rotation. */
+static const double CF_LO[12] = {-128,-128,-128, -80,-80,-80,  -45,-45,-45,  -22,-22,-22 };
+static const double CF_HI[12] = { 128, 128, 128,  80, 80, 80,   55, 55, 55,   22, 22, 22 };
 
 /*==========================================================================*/
 /* mat44 helpers                                                             */
@@ -301,7 +304,7 @@ typedef struct {
     /* precomputed fixed sample set for the current level */
     int    ns; int32_t *sx, *sy, *sz; float *fval; int *fbin; int K;
     double fvar, fmean;        /* fixed-sample variance/mean (LS) */
-    double m_bg;               /* moving-level background (min) fill for out-of-FOV */
+    double m_bg;               /* moving min: LS out-of-FOV fill + HEL binning origin */
     double m_top;              /* moving-level max (for CF_COST_HEL moving-axis binning) */
     double thr_frac;           /* foreground threshold (fraction of dynamic range), set once */
     int    opt_err;            /* set if any NEWUOA call returned a negative error code */
@@ -373,11 +376,11 @@ static double cf_cost_eval(const double p[12]) {
     int ns = c->ns;
     const cf_level *Lm = c->Lm;
 
-    /* Overlap policy (anti "shrinking overlap"): every fixed-foreground sample
-       always contributes. Out-of-FOV samples take the moving BACKGROUND value
-       (m_bg) instead of being dropped, so shrinking the true overlap fills more
-       samples with background and WORSENS the cost. A minimum in-FOV floor still
-       rejects a degenerate near-zero-overlap transform outright. */
+    /* LS retains the fixed-background-fill policy below. The two public fast costs
+       (HEL/CR) instead form their statistics from the actual image intersection:
+       treating an acquisition boundary as moving background biases partial-FOV fits
+       toward scale/shear transforms that pull every fixed sample inside the moving
+       box. A minimum in-FOV floor still rejects a degenerate near-zero intersection. */
     double m_bg = c->m_bg;
 
     if (c->cost == CF_COST_LS) {
@@ -432,8 +435,9 @@ static double cf_cost_eval(const double p[12]) {
             for (int s = lo; s < hi; s++) {
                 double ix, iy, iz; cf_apply(&gam, c->sx[s], c->sy[s], c->sz[s], &ix, &iy, &iz);
                 int ok; float v = cf_trilerp(Lm, ix, iy, iz, &ok);
-                double mv = ok ? v : m_bg;
-                if (ok) lnin++;
+                if (!ok) continue;
+                double mv = v;
+                lnin++;
                 int fb = (int)((long)c->fbin[s] * NB / Kf); if (fb < 0) fb = 0; if (fb >= NB) fb = NB-1;
                 int mb = (int)((mv - c->m_bg) * minv + 0.5); if (mb < 0) mb = 0; if (mb >= NB) mb = NB-1;
                 H[fb*NB + mb] += 1.0;
@@ -495,8 +499,9 @@ static double cf_cost_eval(const double p[12]) {
         for (int s = lo; s < hi; s++) {
             double ix, iy, iz; cf_apply(&gam, c->sx[s], c->sy[s], c->sz[s], &ix, &iy, &iz);
             int ok; float v = cf_trilerp(Lm, ix, iy, iz, &ok);
-            double mv = ok ? v : m_bg;
-            if (ok) lnin++;
+            if (!ok) continue;
+            double mv = v;
+            lnin++;
             int k = c->fbin[s];
             bn[k] += 1.0; bs[k] += mv; bq[k] += (double)mv*mv;
             lN += 1.0; lSy += mv; lSyy += (double)mv*mv;
@@ -521,6 +526,24 @@ static double cf_cost_eval(const double p[12]) {
         within += bn[k]*vk;
     }
     return within / (N * varTot);   /* = 1 - eta^2, minimize */
+}
+
+/* Fraction of the fixed foreground sample cloud covered by the moving FOV. For
+ * comparing two translations of the same moving FOV this ranks identically to
+ * intersection/moving-FOV coverage; the fixed denominator matches the cost samples. */
+static double cf_sample_coverage(const double p[12]) {
+    cf_ctx *c = g_cf;
+    mat44 F2M = cf_affine(c, p);
+    mat44 gam = nifti_mat44_mul(c->Lm->w2v, nifti_mat44_mul(F2M, c->Sf_lvl));
+    long nin = 0;
+    for (int s = 0; s < c->ns; s++) {
+        double ix, iy, iz;
+        cf_apply(&gam, c->sx[s], c->sy[s], c->sz[s], &ix, &iy, &iz);
+        int ok;
+        (void)cf_trilerp(c->Lm, ix, iy, iz, &ok);
+        if (ok) nin++;
+    }
+    return c->ns ? (double)nin / c->ns : 0.0;
 }
 
 /* NEWUOA callback (cf_cost_eval already counts the evaluation). */
@@ -676,19 +699,18 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
 
     /* Build each image's whole pyramid and FREE its full-res copy BEFORE extracting the
        other image, so only ONE full-resolution volume is ever held at a time (plus the
-       small pyramids and one blur scratch). Each COM seed is taken from its full-res
+       small pyramids and one blur scratch). The moving COM is taken from its full-res
        buffer just before that buffer is freed. */
     cf_level Lf[3], Lm[3];
     for (int i=0;i<3;i++){ Lf[i].data=NULL; Lm[i].data=NULL; }
-    double comf[3], comm[3];
-    int build_ok = 1, have_com_f = 0, have_com_m = 0;
+    double comm[3];
+    int build_ok = 1, have_com_m = 0;
 #ifdef AL_PROFILE
     double _tb0 = cf_wtime();
 #endif
     /* fixed pyramid */
     float *ffull = cf_extract_float(fixed, NULL);
     if (!ffull) { g_cf = NULL; fprintf(stderr, "coreg fast: fixed unsupported datatype / OOM\n"); return 1; }
-    have_com_f = O.use_cmass && !cf_com_world(ffull, fnx,fny,fnz, &Sf, &comf[0],&comf[1],&comf[2]);
     if (cf_build_level(ffull, fnx,fny,fnz, &Sf, SEP[2], FWHM[2], &Lf[2])) build_ok = 0;
     free(ffull); ffull = NULL;
     for (int lv = 1; lv >= 0 && build_ok; lv--) {
@@ -709,10 +731,8 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
             }
         }
     }
-    /* -nocmass (O.use_cmass==0) already zeroed have_com_f/have_com_m above by short-circuiting
-       the two cf_com_world() scans, so the header-only start is all that remains. (O is the
-       normalized local copy; `opts` may be NULL under the default-options contract.) */
-    int have_com = have_com_f && have_com_m;
+    /* -nocmass (O.use_cmass==0) already zeroed have_com_m above by short-circuiting
+       cf_com_world(), so the supplied-affine start is all that remains. */
     if (!build_ok) {
         for (int i=0;i<3;i++){ cf_free_level(&Lf[i]); cf_free_level(&Lm[i]); }
         g_cf = NULL;
@@ -742,24 +762,44 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
 #endif
 
         if (lv == 0) {
-            /* Two independent base seeds — the header alignment (p=0) and the COM
-               translation. COM can be unreliable (neck/FOV/modality bias), so BOTH
-               are carried through the coarse search and the global winner is chosen
-               by refined cost rather than committing to one seed up front. */
-            double seeds[2][12]; int nseed = 1;
-            memset(seeds[0], 0, sizeof seeds[0]);       /* header seed */
-            if (have_com) {
-                memset(seeds[1], 0, sizeof seeds[1]);
-                seeds[1][0]=(comm[0]-comf[0])/CF_PS_TRANS;
-                seeds[1][1]=(comm[1]-comf[1])/CF_PS_TRANS;
-                seeds[1][2]=(comm[2]-comf[2])/CF_PS_TRANS;
-                nseed = 2;
+            /* Choose the supplied-affine frame or the exact `-com` recentered frame
+               before the expensive orientation search. In the original world frame,
+               applying `-com` is exactly a translation by the moving brightness
+               centroid, so both starts can be scored against the SAME pyramid.
+
+               HEL and CR are minimized unexplained-dependence coefficients
+               (1 == independent), hence the joint selection score is:
+
+                   (1 - cost) * fraction_of_fixed_foreground_inside_moving_FOV
+
+               Maximizing this rewards both statistical alignment and useful overlap.
+               Multiplying the minimized cost itself by coverage would perversely favor
+               low overlap. Once selected, only ONE seed receives the coarse grid and
+               local descent. Forced `-com` arrives with a recentered header and
+               O.use_cmass==0; `-nocmass` likewise keeps only its supplied frame. */
+            double seeds[1][12]; int nseed = 1;
+            memset(seeds[0], 0, sizeof seeds[0]);
+            if (O.use_cmass && have_com_m) {
+                double hp[12] = {0}, cp[12] = {0};
+                cp[0] = comm[0] / CF_PS_TRANS;
+                cp[1] = comm[1] / CF_PS_TRANS;
+                cp[2] = comm[2] / CF_PS_TRANS;
+                double hc = cf_cost_eval(hp), cc = cf_cost_eval(cp);
+                double hov = cf_sample_coverage(hp), cov = cf_sample_coverage(cp);
+                double hd = 1.0 - hc, cd = 1.0 - cc;
+                if (!cf_finite(hd) || hd < 0.0 || hc >= CF_PENALTY) hd = 0.0;
+                if (!cf_finite(cd) || cd < 0.0 || cc >= CF_PENALTY) cd = 0.0;
+                if (hd > 1.0) hd = 1.0;
+                if (cd > 1.0) cd = 1.0;
+                double hs = hd * hov, cs = cd * cov;
+                if (cs > hs) memcpy(seeds[0], cp, sizeof cp);
+                if (O.verbose)
+                    fprintf(stderr, "[coreg fast] initial affine cost=%.5f overlap=%.5f score=%.5f; "
+                                    "COM cost=%.5f overlap=%.5f score=%.5f -> %s\n",
+                            hc, hov, hs, cc, cov, cs, (cs > hs) ? "COM" : "affine");
             }
 
-            /* Each seed is searched and REFINED independently, then the global best
-               is chosen by *refined* cost. (Ranking pooled candidates by raw coarse
-               cost before refining would let one seed's shallow-but-low candidates
-               crowd out the other seed's deeper basin, which refines far better.) */
+            /* Search and refine the selected start. */
             typedef struct { double p[12]; double c; } cand;
             const double ANG[5] = {-30,-15,0,15,30};
             const int NTOP = 3;

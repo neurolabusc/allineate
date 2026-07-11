@@ -313,9 +313,8 @@ def main():
         rc, _ = run(exe, [j("cf_mov_identity.nii.gz"), j("cf_fix.nii.gz"),
                           "-cost", "fastcr", "-final", "nearest", j("cf_fin.nii.gz")])
         check("coreg fast accepts -final (exit 0)", rc == 0, f"rc={rc}")
-        # -cmass affirms the default COM seed; -nocmass forces the header-only seed. Both are
-        # honored (the engine always competes a header vs a COM-translation seed), so both must
-        # be ACCEPTED and still produce a valid fit on the identity phantom.
+        # -cmass affirms default automatic initialization selection; -nocmass forces the supplied
+        # affine. Both must be accepted and still produce a valid fit on the identity phantom.
         for cm in ("-cmass", "-nocmass"):
             cmj = j(f"cf_cm{cm}.json")
             rc, err = run(exe, [j("cf_mov_identity.nii.gz"), j("cf_fix.nii.gz"),
@@ -461,8 +460,8 @@ def main():
 
         # 11. -cmass/-nocmass BEHAVIORAL divergence (fast engine). Reuses the §7 phantom (cf_fix)
         #     but places the moving header ~42 mm off — beyond the header-start capture range, so
-        #     ONLY the COM-translation seed lands in the right basin. Default and -cmass compete
-        #     the header seed against the COM seed and recover; -nocmass (header-only) fails. An
+        #     ONLY the COM-translation seed lands in the right basin. Default and -cmass select
+        #     the COM start by its initial dependence*overlap score; -nocmass (header-only) fails. An
         #     identity fixture cannot distinguish these, and would not catch an ignored use_cmass
         #     or the NULL-options dereference — this case does.
         print("11. -cmass/-nocmass behavioral divergence (fast engine)")
@@ -481,7 +480,7 @@ def main():
               f"ERMS={erms_cm['cmass']:.2f}")
         check("cmass: -nocmass fails header-only (ERMS > 20 mm)", erms_cm["nocmass"] > 20.0,
               f"ERMS={erms_cm['nocmass']:.2f}")
-        check("cmass: default == -cmass (default already competes both seeds)",
+        check("cmass: default == -cmass (both auto-select the same initialization)",
               abs(erms_cm["default"] - erms_cm["cmass"]) < 1e-6,
               f"default={erms_cm['default']:.4f} cmass={erms_cm['cmass']:.4f}")
 
