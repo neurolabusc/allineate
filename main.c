@@ -42,7 +42,7 @@
 	#define kOS "Windows"
 #endif
 
-#define kMTHdate "v1.0.20260315"
+#define kMTHdate "v1.0.20260712"
 #define kMTHvers kMTHdate kOMPsuf kCCsuf
 
 int show_help( void ) {
@@ -56,10 +56,11 @@ int show_help( void ) {
 	printf("                                 'hel' (Hellinger) is a robust cross-modal method\n");
 	printf("                                 Other cost functions for special cases\n");
 	printf("                                 The fast engine has a fixed config: -warp/-interp/\n");
-	printf("                                 -source_automask/-dark_automask/-sym/-zoom/-skullstrip are\n");
+	printf("                                 -source_automask/-dark_automask/-zoom/-skullstrip are\n");
 	printf("                                 not supported with it (-final sets output interp; default/\n");
 	printf("                                 -cmass auto-select initialization, -com forces COM,\n");
-	printf("                                 -nocmass forces the supplied affine).\n");
+	printf("                                 -nocmass forces the supplied affine; the -com/-sym header\n");
+	printf("                                 seeds DO work with it).\n");
 	printf("                       -cmass -nocmass -source_automask\n");
 	printf("                       -dark_automask  ignore matched pairs where either image is at its\n");
 	printf("                                 darkest value (background/zero-pad); uses each image's own\n");
@@ -114,8 +115,6 @@ int show_help( void ) {
 	return 0;
 }
 
-/* Finalize output: for stdout, force single-file NIfTI-1 and set names to "-";
-   otherwise set the output filename. Then write. Returns 0 on success. */
 /* Deep-copy the header + voxel data of a nifti_image (the fields the affine reslice and
    writer read: dims, sform/qform, pixdim, and the data buffer). Filenames and extensions
    are dropped — the writer sets a fresh output name — so nifti_image_free() on the copy
@@ -143,6 +142,8 @@ static int resolve_output_interp(const al_opts *o) {
 	return (o->final_interp == AL_INTERP_DEFAULT) ? AL_INTERP_CUBIC : o->final_interp;
 }
 
+/* Finalize output: for stdout, force single-file NIfTI-1 and set names to "-";
+   otherwise set the output filename. Then write. Returns 0 on success. */
 static int write_result(nifti_image *out, const char *output_name, int isStdOut) {
 	if (isStdOut) {
 		free(out->fname); out->fname = nifti_strdup("-");
@@ -404,22 +405,31 @@ int main(int argc, char * argv[]) {
 	   stationary pair with no explicit -cost and no special mode). A fast failure on a tiny or
 	   degenerate volume falls back to the Hellinger engine below, so a bare registration never
 	   regresses. Modes with their own engine (-applymat, -skullstrip) and preprocessing-only runs
-	   (no stationary) keep their paths; an explicit -cost (fast/fastcr or hel/lpc/lpa/ls) wins. */
+	   (no stationary) keep their paths; an explicit -cost (fast/fastcr or hel/lpc/lpa/ls) wins.
+	   The fast engine cannot honor -zoom/-source_automask/-dark_automask/-warp/-interp; if the
+	   user gave any of those WITHOUT an explicit -cost fast, stay on the ordinary engine rather
+	   than defaulting to fast and erroring (an explicit -cost fast + such an option still errors
+	   below). -com and -sym/-symd/-symb are header-only seeds applied below to BOTH engines, so
+	   they do NOT disable default-fast. */
+	int fast_incompatible = opts.zoom || opts.source_automask || opts.dark_automask ||
+	                        (opts.cli_set & (AL_CLI_WARP | AL_CLI_INTERP));
 	int fast_default = !(opts.cli_set & AL_CLI_COST) && !opts.fast &&
-	                   stationary_name && !opts.applymat && !opts.skullstrip;
+	                   stationary_name && !opts.applymat && !opts.skullstrip && !fast_incompatible;
 	if (fast_default)
 		opts.fast = AL_ENGINE_FAST_HEL;
 	/* The fast engine (-cost fast/-cost fastcr) is a distinct estimator: it needs a
-	   stationary image and does not (yet) compose with the -sym/-zoom/-skullstrip
-	   header-seed workflow. */
+	   stationary image. It consumes the -com/-sym header seeds (applied below, before the
+	   engine branch) but cannot compose with -skullstrip or -zoom (the latter relaxes the
+	   affine scale range the fast pyramid's fixed scale capture cannot widen). */
 	if (opts.fast) {
 		const char *fflag = (opts.fast == AL_ENGINE_FAST_HEL) ? "-cost fast" : "-cost fastcr";
 		if (!stationary_name && !opts.applymat) {
 			fprintf(stderr, "%s requires a <stationary> image to register against\n", fflag);
 			return 1;
 		}
-		if (opts.skullstrip || opts.sym || opts.zoom) {
-			fprintf(stderr, "%s cannot be combined with -skullstrip/-sym/-zoom\n", fflag);
+		if (opts.skullstrip || opts.zoom) {
+			fprintf(stderr, "%s cannot be combined with -skullstrip/-zoom "
+			                "(-zoom relaxes the affine scale range the fast pyramid cannot widen)\n", fflag);
 			return 1;
 		}
 		/* The fast engine has a FIXED configuration (the cost is chosen by the selector —
@@ -629,6 +639,28 @@ int main(int argc, char * argv[]) {
 		}
 		nifti_image_free(stationary);
 	} else {
+	  /* -sym pre-step (header-only seed, consumed by EITHER engine): fold the midsagittal
+	     correction into the moving header as an initial estimate before registering to the
+	     template, then -sagseed (default on) recovers the 3 in-MSP DOF -sym is blind to via a
+	     constrained fit to the template. Applied here, before the engine branch, so the fast
+	     engine starts from the seeded pose (as it already does for the -com seed above). */
+	  if (opts.sym) {
+		if (nii_ensure_float32(moving)) {
+			fprintf(stderr, "Failed to convert '%s' to float32 for -sym\n", moving_name);
+			nifti_image_free(moving); nifti_image_free(stationary);
+			goto cleanup;
+		}
+		if (nii_symmetry(moving, NULL, 0 /*seed header, no reslice*/, opts.sym_deoblique, opts.dark_automask)) {
+			fprintf(stderr, "-sym pre-step failed on '%s'\n", moving_name);
+			nifti_image_free(moving); nifti_image_free(stationary);
+			goto cleanup;
+		}
+		if (opts.sagseed && nii_sagseed(moving, stationary, opts)) {
+			fprintf(stderr, "-sagseed pre-step failed on '%s'\n", moving_name);
+			nifti_image_free(moving); nifti_image_free(stationary);
+			goto cleanup;
+		}
+	  }
 	  if (opts.fast) {
 		/* Fast SPM/FLIRT-inspired affine path (-cost fast / -cost fastcr). Estimates a world-mm
 		   FIXED->MOVING affine without mutating the inputs, then reslices the moving
@@ -703,31 +735,8 @@ int main(int argc, char * argv[]) {
 	  }
 	  if (!opts.fast) {
 		/* Normal allineate engine (an explicit non-fast -cost, or the default-fast fallback above).
-		   Optional -sym pre-step: fold the midsagittal correction into the moving
-		   image header as an initial estimate before registering to the template. */
-		if (opts.sym) {
-			if (nii_ensure_float32(moving)) {
-				fprintf(stderr, "Failed to convert '%s' to float32 for -sym\n", moving_name);
-				nifti_image_free(moving);
-				nifti_image_free(stationary);
-				goto cleanup;
-			}
-			if (nii_symmetry(moving, NULL, 0 /*seed header, no reslice*/, opts.sym_deoblique, opts.dark_automask)) {
-				fprintf(stderr, "-sym pre-step failed on '%s'\n", moving_name);
-				nifti_image_free(moving);
-				nifti_image_free(stationary);
-				goto cleanup;
-			}
-			/* -sagseed (default on): recover the 3 in-MSP DOF -sym is blind to
-			   (y-shift, z-shift, pitch) via a constrained fit to the template,
-			   completing the full-rigid seed. -nosagseed disables it. */
-			if (opts.sagseed && nii_sagseed(moving, stationary, opts)) {
-				fprintf(stderr, "-sagseed pre-step failed on '%s'\n", moving_name);
-				nifti_image_free(moving);
-				nifti_image_free(stationary);
-				goto cleanup;
-			}
-		}
+		   The -com/-sym/-sagseed header seeds were applied above (shared with the fast engine);
+		   moving is already seeded as it enters the fit. */
 		/* -master: nii_allineate reslices `moving` in place onto the stationary grid, so
 		   preserve the moving image AS IT ENTERS the fit (after any -sym/-com/-robustfov
 		   pre-steps — the fitted matrix is relative to that seeded header). After the fit

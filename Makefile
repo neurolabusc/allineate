@@ -54,7 +54,7 @@ endif
 # semantics while still getting fast-math reassociation is load-bearing here.
 CFLAGS ?= -O3 -ffast-math -fno-finite-math-only
 
-.PHONY: all test sanitize debug profile clean
+.PHONY: all test parity sanitize debug profile clean
 
 # `all` is phony so `make` ALWAYS rebuilds and overwrites the binary — no stale
 # binary, no confusing "Nothing to be done". This is a whole-program compile with
@@ -78,6 +78,22 @@ test: all
 		$(ZLIB) $(OMPLINK) -lm -o $(CAPI_OUT)
 	python3 test/test_regression.py --allineate ./$(OUT)
 	python3 test/test_coreg_fast.py
+
+# Optional shared-source parity check — NOT part of `make test`, so a clean clone with no
+# niimath checkout still builds and gates. Confirms the eight drop-in files are byte-for-byte
+# identical to their niimath source of truth (silent drift here has twice shipped a stale
+# nifti_io.c past a green `make test`). Supply the checkout path; exits nonzero listing any
+# drifted file so a release/CI step can gate on it separately from the correctness gate:
+#     make parity NIIMATH=/path/to/niimath
+SHARED = allineate.c allineate.h coreg_fast.c coreg_fast.h powell_newuoa.c nifti_io.c nifti_io.h core32.h
+parity:
+	@test -n "$(NIIMATH)" || { echo "set NIIMATH=/path/to/niimath (its src/ holds the source of truth)"; exit 2; }
+	@rc=0; for f in $(SHARED); do \
+		if cmp -s "$$f" "$(NIIMATH)/src/$$f"; then echo "  ok    $$f"; \
+		else echo "  DRIFT $$f"; rc=1; fi; \
+	done; \
+	if [ $$rc -ne 0 ]; then echo "** parity FAILED — resync drifted files from $(NIIMATH)/src"; fi; \
+	exit $$rc
 
 # AddressSanitizer build for heap-overflow / use-after-free testing.
 #
