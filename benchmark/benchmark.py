@@ -20,6 +20,7 @@ Outputs go to outputs/ (untracked; they overwrite freely). Markdown tables are p
 
 Usage:
     python3 benchmark.py                 # allineate + fast engines
+    python3 benchmark.py --engine allineate  # only the ordinary default engine
     python3 benchmark.py --afni          # also benchmark AFNI 3dAllineate (must be on PATH)
     python3 benchmark.py --allineate ../allineate
 """
@@ -165,6 +166,8 @@ def main():
                     help="path to the allineate binary (default: repo root)")
     ap.add_argument("--afni", action="store_true",
                     help="also benchmark AFNI 3dAllineate (must be on PATH)")
+    ap.add_argument("--engine", choices=("both", "allineate", "fast"), default="both",
+                    help="project engine(s) to benchmark (default: both)")
     ap.add_argument("--timeout", type=int, default=3600,
                     help="per-registration timeout in seconds (default: 3600)")
     args = ap.parse_args()
@@ -172,7 +175,7 @@ def main():
     if not os.access(args.allineate, os.X_OK):
         sys.exit(f"allineate binary not found/executable at '{args.allineate}' — run `make` in {REPO}")
 
-    engines = ["allineate", "fast"]
+    engines = (["allineate", "fast"] if args.engine == "both" else [args.engine])
     if args.afni:
         if shutil.which("3dAllineate") is None:
             sys.exit("--afni given but 3dAllineate is not on PATH")

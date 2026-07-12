@@ -12,6 +12,7 @@
  */
 
 #include "nifti_io.h"
+#include "core32.h"
 
 /* Ensure nim->data is DT_FLOAT32, converting in place from the common
  * integer/float datatypes and applying scl_slope/scl_inter. On success the data
@@ -31,20 +32,5 @@ int nii_ensure_float32(nifti_image *nim);
  * cropped but keeps no valid spatial transform.
  * Returns 0 on success (image may be modified in place), 1 on error. */
 int nifti_robustfov(nifti_image *nim, double fovmm);
-
-/* Separable 3D Gaussian blur of a raw float buffer, in place. Clean-room-permitted
- * port of niimath coreFLT.c's nifti_smooth_gauss/blurS/blurP (BSD/public-domain,
- * NOT src/GPL/). The sigma arguments are Gaussian sigmas in **mm** (per axis); each
- * is converted to voxels via the matching pixdim internally. A sigma <= 0 skips that
- * axis. `kernelWid` sets the FIR half-width: >0 => ceil(kernelWid*sigma_vox) voxels,
- * <0 => round(|kernelWid|*sigma_vox) (SPM/FSL use ~6; AFNI ~2.5). Uses OpenMP across
- * rows when available. Precondition: the spatial product nx*ny*nz must fit in a
- * signed int (INT_MAX) — the internal blur/transpose helpers use int row products
- * and offsets; a larger volume is rejected up front. Returns 0 on success, 1 on
- * error (bad/oversized dims or allocation failure; buffer may be partially blurred
- * on an allocation failure). */
-int mcf_smooth_gauss(float *data, int nx, int ny, int nz,
-                     float dx, float dy, float dz,
-                     float sigX_mm, float sigY_mm, float sigZ_mm, float kernelWid);
 
 #endif /* MINICOREFLT_H */

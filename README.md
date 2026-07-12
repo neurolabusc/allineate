@@ -8,12 +8,11 @@ Standalone affine (12 DOF) image registration for NIfTI files. Adapted from AFNI
 allineate <moving> <stationary> [opts] <output>
 ```
 
-Use `-` for `<moving>` to read the moving image from **stdin**, and `-` for
-`<output>` to write the result to **stdout** (see [Piping](#piping)).
+Use `-` for `<moving>` to read the moving image from **stdin**, and `-` for `<output>` to write the result to **stdout** (see [Piping](#piping)).
 
 Options:
-- `-cost fast` / `-cost fastcr` — use the **fast** SPM/FLIRT-inspired affine engine instead of the default allineate engine (default: allineate). An independently implemented multiresolution 12-DOF path (8→4→2 mm pyramid) tuned for 3D adult brains. The coarse (8 mm) level searches orientation+translation as a **rigid** body with global scale locked at identity; global scale is introduced at 4 mm (with a discrete scale bracket so a true envelope-edge scale is still recovered) and anisotropic scale/shear at 2 mm (rigid→7→9→12 DOF). Locking scale at the coarsest level is deliberate: freeing it there lets the cost fall into a spurious isotropic-shrink basin on wide-FOV / short-axis cross-modal inputs. **~8–25× faster single-thread than the allineate engine (and ~20–130× faster than AFNI 3dAllineate), with lower peak RAM on every pair** (see `benchmark/README.md`). Returns and `-savemat`s the same world-mm `fixed_to_moving` transform. Not combinable with `-skullstrip`/`-sym`/`-zoom`; requires usable sform/qform geometry. Seeding: the coarse search always competes a header-alignment start against a center-of-mass start and keeps whichever refines better — `-cmass` affirms this default, `-nocmass` drops the COM seed for a header-only start. Envelope: translation ≤ 30 mm, rotation ≤ 30°, global scale 0.75–1.33 (wide-scale/infant cases stay on the allineate `-zoom` path). Two cost selectors:
-  - `-cost fast` (**default fast cost**, **Hellinger**) — robust for **cross-modal** registration (e.g. `T2w → T1` template): on the bundled T2w pairs its **full** Hellinger score slightly *beats* allineate (see `benchmark/README.md`), fixing the shrink/roll that correlation-ratio suffers cross-modal. Comparable for same-modality (full Hellinger tracks allineate within ~0.006; a touch below on the brain-masked metric). Quality (Hellinger-affinity metric) matches allineate on same-modality T1. Caveat: on T2w the **masked** (brain-interior) Hellinger is a touch below allineate — for the tightest T2w brain-interior fit allineate is still marginally ahead.
+- `-cost fast` / `-cost fastcr` — use the **fast** SPM/FLIRT-inspired affine engine instead of the default allineate engine (default: allineate). An independently implemented multiresolution 12-DOF path (8→4→2 mm pyramid) tuned for 3D adult brains. The coarse (8 mm) level searches orientation+translation as a **rigid** body with global scale locked at identity; global scale is introduced at 4 mm (with a discrete scale bracket so a true envelope-edge scale is still recovered) and anisotropic scale/shear at 2 mm (rigid→7→9→12 DOF). Locking scale at the coarsest level is deliberate: freeing it there lets the cost fall into a spurious isotropic-shrink basin on wide-FOV / short-axis cross-modal inputs. Returns and `-savemat`s the same world-mm `fixed_to_moving` transform. Not combinable with `-skullstrip`/`-sym`/`-zoom`. Default/`-cmass` scores the supplied-affine and COM-recentered starts once at 8 mm using `(1-cost)×overlap`, then runs only the winning descent; `-com` forces the recentered frame and `-nocmass` forces the supplied affine. The translation guardrail is ±128 mm, rotation capture is approximately ±30°, and global scale capture is approximately 0.75–1.33 (wide-scale/infant cases stay on the allineate `-zoom` path). Two cost selectors:
+  - `-cost fast` (**default fast cost**, **Hellinger**) — robust for **cross-modal** registration (e.g. FLAIR/T2w → T1 template), fixing the shrink/roll that correlation-ratio suffers cross-modal. It remains much faster than the ordinary engine, while the ordinary engine's AFNI-style far-origin search now gives essentially the same MICCAI quality against the 1 mm MNI template. Same-modality T1 full Hellinger remains within ~0.009 of allineate. On the original T2w pairs no engine wins every metric: fast is slightly ahead on MNI full Hellinger and avg152T1 masked Hellinger, while allineate leads the complementary two scores. See `benchmark/README.md`.
   - `-cost fastcr` (**correlation-ratio**) — the CR cost is **unstable when modalities differ** (spurious isotropic shrink/roll on cross-modal); prefer `-cost fast` for any cross-modal work. Best kept for same-modality inputs, where it matches allineate quality. (CR is also what the synthetic capture suites use, because Hellinger/MI is imprecise on smooth/low-detail volumes and can't sharply recover the synthetic test phantoms.)
 - `-cost XX` — cost function (allineate engine): `hel` (Hellinger, default), `lpc` (local Pearson, cross-modal), `lpa` (abs local Pearson, cross-modal), `ls` (Pearson/least-squares)
 - `-cmass` / `-nocmass` — center-of-mass initialization
@@ -36,12 +35,9 @@ Options:
 - `-sym` — template-free midsagittal-plane (MSP) alignment. Registers the image to its own world-X mirror, takes the half of the recovered rigid transform, and applies it as a re-centering correction. **Standalone** (no stationary image): reslices the data symmetric about world X = 0. **As a pre-step** (with a stationary image): folds the correction into the moving header as an initial estimate before registering to the template
 - `-nosagseed` — disable the **`-sagseed`** in-MSP rigid seed, which is **on by default whenever `-sym` runs with a stationary template**. `-sym` centers the MSP on world X = 0 but is blind to the three MSP-preserving rigid DOF (P-A shift, I-S shift, and pitch); `-sagseed` then runs a 3-DOF-constrained fit of the moving image to the (MSP-aligned) template freeing only those {y-shift, z-shift, pitch}, and folds the result into the moving header — completing a full-rigid seed before the main unconstrained fit. Uses the same `-cost`/`-interp`/`-source_automask`/`-cmass` as the main registration. No standalone mode (it needs a template); it does nothing without `-sym`
 
-The stationary image is optional: with only a moving image and a preprocessing
-option, `allineate` runs the preprocessing and writes the result (no registration):
+The stationary image is optional: with only a moving image and a preprocessing option, `allineate` runs the preprocessing and writes the result (no registration):
 
-Registration inputs must carry a valid spatial transform: the sform is used when
-`sform_code >= qform_code`, otherwise the qform; if the preferred form is unset or
-degenerate the other is tried, and an input with neither usable is rejected.
+Registration uses the sform when `sform_code >= qform_code`, otherwise the qform; if the preferred form is unset or degenerate the other is tried. An input with neither usable form receives the same pixdim-centered fallback frame used by niimath.
 
 ```bash
 allineate neck.nii.gz -robustfov out.nii.gz                    # crop neck only
@@ -60,14 +56,11 @@ allineate tilted.nii.gz MNI152_T1_1mm -sym -nosagseed out      # MSP seed only (
 The moving image and the output support UNIX pipes via `-`:
 
 ```bash
-# gzipped or uncompressed NIfTI-1 on stdin; result to stdout, then compress
-cat moving_2mm.nii.gz | allineate - template_2mm.nii.gz -cost ls - | gzip > out.nii.gz
+# uncompressed NIfTI-1 on stdin; result to stdout, then compress
+cat moving_2mm.nii | allineate - template_2mm.nii.gz -cost ls - | gzip > out.nii.gz
 ```
 
-Piped input may be gzip-compressed (`.nii.gz`) or raw `.nii`; it is auto-detected.
-Only the moving image can come from stdin — the stationary image and the
-`-skullstrip` mask must be files. Piped **output** is uncompressed NIfTI-1 (pipe
-through `gzip` for compression). Piped I/O supports NIfTI-1 only.
+Piped input uses raw NIfTI-1, matching the shared niimath I/O layer. Only the moving image can come from stdin — the stationary image and the `-skullstrip` mask must be files. Piped **output** is uncompressed NIfTI-1 (pipe through `gzip` for compression). Piped I/O supports NIfTI-1 only.
 
 ## Build
 
@@ -82,9 +75,7 @@ make clean
 # package makes the gate exit 2, distinct from a product regression (exit 1).
 ```
 
-On Apple Silicon macOS LeakSanitizer is unavailable, so `make sanitize` does not
-catch leaks there; use `MallocNanoZone=0 leaks --atExit -- ./allineate …` for leak
-detection.
+On Apple Silicon macOS LeakSanitizer is unavailable, so `make sanitize` does not catch leaks there; use `MallocNanoZone=0 leaks --atExit -- ./allineate …` for leak detection.
 
 Or compile manually (note the `miniCoreFLT.c` source):
 
@@ -99,16 +90,12 @@ gcc-15 -O3 -ffast-math -fno-finite-math-only -fopenmp -DHAVE_ZLIB main.c allinea
 gcc -O3 -ffast-math -fno-finite-math-only -fopenmp -DHAVE_ZLIB main.c allineate.c nifti_io.c powell_newuoa.c miniCoreFLT.c coreg_fast.c -lz -lm -o allineate
 ```
 
-
 ## Examples
 
-The benchmark harness runs on the bundled datasets under `benchmark/inputs/`,
-`benchmark/templates/`, and `benchmark/masks/` (see `benchmark/README.md`), or substitute your
-own NIfTI volumes:
+The benchmark harness runs on the bundled datasets under `benchmark/inputs/`, `benchmark/templates/`, and `benchmark/masks/` (see `benchmark/README.md`), or substitute your own NIfTI volumes:
 
 ```bash
 ./allineate moving.nii.gz template.nii.gz registered.nii.gz
 ```
 
-The `benchmark/` folder also has a script for evaluating speed/quality across all three engines,
-`benchmark/benchmark.py` (see `benchmark/README.md`).
+The `benchmark/` folder also has a script for evaluating speed/quality across all three engines, `benchmark/benchmark.py` (see `benchmark/README.md`).

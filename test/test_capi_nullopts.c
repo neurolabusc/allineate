@@ -43,9 +43,9 @@ int main(int argc, char **argv) {
     /* A Gaussian radius wider than its row must be clipped before integer conversion
        and allocation; only three samples can contribute here despite the tiny spacing. */
     float impulse[3] = {0.0f, 1.0f, 0.0f};
-    if (mcf_smooth_gauss(impulse, 3, 1, 1, 1e-9f, 1.0f, 1.0f,
-                         1.0f, 0.0f, 0.0f, -6.0f)) {
-        fprintf(stderr, "mcf_smooth_gauss rejected a bounded wide kernel\n");
+    if (nifti_smooth_gauss_f32(impulse, 3, 1, 1, 1, 1e-9f, 1.0f, 1.0f,
+                               1.0f, 0.0f, 0.0f, -6.0f)) {
+        fprintf(stderr, "nifti_smooth_gauss_f32 rejected a bounded wide kernel\n");
         return 1;
     }
     return 0;
