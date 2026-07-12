@@ -404,9 +404,15 @@ int main(int argc, char * argv[]) {
 	   stationary pair with no explicit -cost and no special mode). A fast failure on a tiny or
 	   degenerate volume falls back to the Hellinger engine below, so a bare registration never
 	   regresses. Modes with their own engine (-applymat, -skullstrip) and preprocessing-only runs
-	   (no stationary) keep their paths; an explicit -cost (fast/fastcr or hel/lpc/lpa/ls) wins. */
+	   (no stationary) keep their paths; an explicit -cost (fast/fastcr or hel/lpc/lpa/ls) wins.
+	   The fast engine cannot honor -sym/-zoom/-source_automask/-dark_automask/-warp/-interp; if
+	   the user gave any of those WITHOUT an explicit -cost fast, stay on the ordinary engine
+	   rather than defaulting to fast and erroring (an explicit -cost fast + such an option still
+	   errors below). */
+	int fast_incompatible = opts.sym || opts.zoom || opts.source_automask || opts.dark_automask ||
+	                        (opts.cli_set & (AL_CLI_WARP | AL_CLI_INTERP));
 	int fast_default = !(opts.cli_set & AL_CLI_COST) && !opts.fast &&
-	                   stationary_name && !opts.applymat && !opts.skullstrip;
+	                   stationary_name && !opts.applymat && !opts.skullstrip && !fast_incompatible;
 	if (fast_default)
 		opts.fast = AL_ENGINE_FAST_HEL;
 	/* The fast engine (-cost fast/-cost fastcr) is a distinct estimator: it needs a
