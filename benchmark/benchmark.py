@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Benchmark affine registration engines: register every moving image in inputs/ to every
-stationary template in templates/, with DEFAULT settings, and report speed / memory / match
-quality for each engine in its own table:
+stationary template in templates/ and report speed / memory / match
+quality for each engine in its own table (`fast` is the default cost, so the ordinary
+AFNI-style engine is selected explicitly with `-cost hel`):
 
-  * allineate  — `allineate <mov> <fix> out`            (this project's default engine)
-  * fast       — `allineate <mov> <fix> -cost fast out` (SPM/FLIRT-inspired path, Hellinger cost)
+  * allineate  — `allineate <mov> <fix> -cost hel out`  (AFNI-style ordinary engine)
+  * fast       — `allineate <mov> <fix> out`            (SPM/FLIRT-inspired path, now the DEFAULT, Hellinger cost)
+  * fast-robust — `allineate <mov> <fix> -robustfov -com -cost fast out`
   * AFNI       — `3dAllineate -base <fix> -source <mov> -prefix out` (reference; only with --afni)
 
 Each engine runs every pair at 1 thread and at all cores (N = os.cpu_count()), so a single table
@@ -20,7 +22,8 @@ Outputs go to outputs/ (untracked; they overwrite freely). Markdown tables are p
 
 Usage:
     python3 benchmark.py                 # allineate + fast engines
-    python3 benchmark.py --engine allineate  # only the ordinary default engine
+    python3 benchmark.py --engine allineate  # only the ordinary AFNI-style engine (-cost hel)
+    python3 benchmark.py --engine fast-robust  # robust preprocessing + fast engine
     python3 benchmark.py --afni          # also benchmark AFNI 3dAllineate (must be on PATH)
     python3 benchmark.py --allineate ../allineate
 """
@@ -126,8 +129,9 @@ def _run_afni(mov, fix, out, threads, allineate, timeout):
 
 
 ENGINES = {
-    "allineate": _run_allineate([]),
+    "allineate": _run_allineate(["-cost", "hel"]),
     "fast": _run_allineate(["-cost", "fast"]),
+    "fast-robust": _run_allineate(["-robustfov", "-com", "-cost", "fast"]),
     "afni": _run_afni,
 }
 
@@ -166,7 +170,8 @@ def main():
                     help="path to the allineate binary (default: repo root)")
     ap.add_argument("--afni", action="store_true",
                     help="also benchmark AFNI 3dAllineate (must be on PATH)")
-    ap.add_argument("--engine", choices=("both", "allineate", "fast"), default="both",
+    ap.add_argument("--engine", choices=("both", "allineate", "fast", "fast-robust"),
+                    default="both",
                     help="project engine(s) to benchmark (default: both)")
     ap.add_argument("--timeout", type=int, default=3600,
                     help="per-registration timeout in seconds (default: 3600)")
@@ -234,8 +239,9 @@ def main():
           "(peak RSS); *Speed Up* = 1-thread Time / N-thread Time; *Cost* / *Cost Masked* = "
           "Hellinger-affinity match quality (higher = better; masked restricts to the template "
           f"brain mask). The `1` columns are single-thread, the `{N_THREADS}` columns use all cores.\n")
-    titles = {"allineate": "allineate (default engine)",
-              "fast": "fast (`-cost fast`)",
+    titles = {"allineate": "allineate ordinary engine (`-cost hel`)",
+              "fast": "fast (`-cost fast`, the default)",
+              "fast-robust": "fast robust (`-robustfov -com -cost fast`)",
               "afni": "AFNI 3dAllineate (reference, defaults)"}
     for engine in engines:
         print(f"### {titles[engine]}\n")

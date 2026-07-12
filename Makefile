@@ -64,12 +64,13 @@ all:
 	rm -f $(OUT)
 	$(CNAME) $(CFLAGS) $(OMPFLAGS) $(ZFLAGS) $(SRC) $(ZLIB) $(OMPLINK) -lm -o $(OUT)
 
-# Deterministic correctness gate: builds synthetic (non-facial) fixtures and asserts
-# the geometry/preprocessing/affine paths. Exits nonzero on any failure, so CI or a
-# release script can gate on it. Needs python3 + numpy + nibabel.
+# Deterministic correctness gate: builds generated non-facial fixtures plus two
+# known-transform fixtures derived from the bundled non-subject MNI atlas, then asserts the
+# geometry/preprocessing/affine paths. Exits nonzero on any failure, so CI or a release script
+# can gate on it. Needs python3 + numpy + nibabel.
 # The C-API harness links the estimator WITHOUT main.c to exercise coreg_fast_estimate()
 # with NULL opts (the default-options contract) — a path the CLI never takes. Built here so
-# `make test` also gates it; test_regression.py (§12) generates fixtures and runs it.
+# `make test` also gates it; test_regression.py (§13) generates fixtures and runs it.
 CAPI_OUT = test_capi_nullopts
 test: all
 	$(CNAME) $(CFLAGS) $(OMPFLAGS) $(ZFLAGS) -I. test/test_capi_nullopts.c \

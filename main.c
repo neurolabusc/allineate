@@ -50,12 +50,12 @@ int show_help( void ) {
 	printf(" <moving> <stationary> [opts] <output>: co-register the moving image match the stationary image\n");
 	printf(" <moving> [opts] <output>            : preprocess only (e.g. -robustfov), no registration\n");
 	printf("                 Use '-' for <moving> to read from stdin, '-' for <output> to write to stdout\n");
-	printf("                 opts: -cost XX  cost function / engine:\n");
-	printf("                                 allineate engine: hel (Hellinger, default), lpc, lpa, ls;\n");
-	printf("                                 fast engine (lower RAM, 12-DOF): 'fast'\n");
-	printf("                                 (Hellinger — robust cross-modal, recommended) or 'fastcr'\n");
-	printf("                                 (correlation-ratio — unstable when modalities\n");
-	printf("                                 differ). The fast engine has a fixed config: -warp/-interp/\n");
+	printf("                 opts: -cost XX  cost function:\n");
+	printf("                                 options: fast (default), hel, lpc, lpa, ls, fastcr;\n");
+	printf("                                 'fast' is SPM/FLIRT inspired affine\n");
+	printf("                                 'hel' (Hellinger) is a robust cross-modal method\n");
+	printf("                                 Other cost functions for special cases\n");
+	printf("                                 The fast engine has a fixed config: -warp/-interp/\n");
 	printf("                                 -source_automask/-dark_automask/-sym/-zoom/-skullstrip are\n");
 	printf("                                 not supported with it (-final sets output interp; default/\n");
 	printf("                                 -cmass auto-select initialization, -com forces COM,\n");
@@ -109,7 +109,8 @@ int show_help( void ) {
 	printf("                                 the default (adult) behavior are unchanged.\n");
 	printf("                       -p <threads>  set the maximum number of parallel threads\n");
 	printf("                                 (0 = use all available); only affects OpenMP builds\n");
-	printf("                       default cost: Hellinger; use -source_automask with lpc/lpa\n");
+	printf("                       default cost: fast (no -cost == -cost fast); use -cost hel for AFNI\n");
+	printf("                                 3dAllineate-style behavior, and -source_automask with lpc/lpa\n");
 	return 0;
 }
 
@@ -399,6 +400,15 @@ int main(int argc, char * argv[]) {
 		fprintf(stderr, "-savemat requires a <stationary> image to register against\n");
 		return 1;
 	}
+	/* Default cost is the fast SPM/FLIRT-inspired engine for a plain registration (a moving+
+	   stationary pair with no explicit -cost and no special mode). A fast failure on a tiny or
+	   degenerate volume falls back to the Hellinger engine below, so a bare registration never
+	   regresses. Modes with their own engine (-applymat, -skullstrip) and preprocessing-only runs
+	   (no stationary) keep their paths; an explicit -cost (fast/fastcr or hel/lpc/lpa/ls) wins. */
+	int fast_default = !(opts.cli_set & AL_CLI_COST) && !opts.fast &&
+	                   stationary_name && !opts.applymat && !opts.skullstrip;
+	if (fast_default)
+		opts.fast = AL_ENGINE_FAST_HEL;
 	/* The fast engine (-cost fast/-cost fastcr) is a distinct estimator: it needs a
 	   stationary image and does not (yet) compose with the -sym/-zoom/-skullstrip
 	   header-seed workflow. */
@@ -618,7 +628,8 @@ int main(int argc, char * argv[]) {
 			goto cleanup;
 		}
 		nifti_image_free(stationary);
-	} else if (opts.fast) {
+	} else {
+	  if (opts.fast) {
 		/* Fast SPM/FLIRT-inspired affine path (-cost fast / -cost fastcr). Estimates a world-mm
 		   FIXED->MOVING affine without mutating the inputs, then reslices the moving
 		   image onto the stationary grid once. Result-based -savemat. */
@@ -630,10 +641,20 @@ int main(int argc, char * argv[]) {
 		                 !((opts.cli_set & AL_CLI_CMASS) && opts.cmass == AL_CMASS_NONE);
 		coreg_fast_result res;
 		if (coreg_fast_estimate(moving, stationary, &cfo, &res)) {
-			fprintf(stderr, "Fast registration failed\n");
-			nifti_image_free(moving); nifti_image_free(stationary);
-			goto cleanup;
-		}
+			if (fast_default) {
+				/* The default fast engine could not register this image (too small/degenerate for
+				   its pyramid). Fall back to the robust Hellinger engine below so a bare
+				   registration never regresses; an explicit -cost fast/fastcr still errors.
+				   moving/stationary are intact (the failed estimate does not mutate them). */
+				fprintf(stderr, " + Fast registration failed; falling back to -cost hel\n");
+				opts.fast = 0;
+				opts.cost = AL_COST_HELLINGER;
+			} else {
+				fprintf(stderr, "Fast registration failed\n");
+				nifti_image_free(moving); nifti_image_free(stationary);
+				goto cleanup;
+			}
+		} else {
 		fprintf(stderr, "Fast registration: %d levels, %d evals, cost=%.5f, %.0f ms\n",
 			res.levels_completed, res.evaluations, res.final_cost, res.registration_ms);
 		/* Only reslice the moving image if an output image is requested. Matrix-only
@@ -678,8 +699,11 @@ int main(int argc, char * argv[]) {
 		}
 		if (opts.savemat) fprintf(stderr, " + Saved affine to '%s'\n", opts.savemat);
 		nifti_image_free(moving);
-	} else {
-		/* Optional -sym pre-step: fold the midsagittal correction into the moving
+		}
+	  }
+	  if (!opts.fast) {
+		/* Normal allineate engine (an explicit non-fast -cost, or the default-fast fallback above).
+		   Optional -sym pre-step: fold the midsagittal correction into the moving
 		   image header as an initial estimate before registering to the template. */
 		if (opts.sym) {
 			if (nii_ensure_float32(moving)) {
@@ -763,6 +787,7 @@ int main(int argc, char * argv[]) {
 			fprintf(stderr, " + Saved affine to '%s'\n", opts.savemat);
 		}
 		nifti_image_free(moving);
+	  }
 	}
 	rc = 0;
 cleanup:
