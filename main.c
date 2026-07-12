@@ -115,8 +115,6 @@ int show_help( void ) {
 	return 0;
 }
 
-/* Finalize output: for stdout, force single-file NIfTI-1 and set names to "-";
-   otherwise set the output filename. Then write. Returns 0 on success. */
 /* Deep-copy the header + voxel data of a nifti_image (the fields the affine reslice and
    writer read: dims, sform/qform, pixdim, and the data buffer). Filenames and extensions
    are dropped — the writer sets a fresh output name — so nifti_image_free() on the copy
@@ -144,6 +142,8 @@ static int resolve_output_interp(const al_opts *o) {
 	return (o->final_interp == AL_INTERP_DEFAULT) ? AL_INTERP_CUBIC : o->final_interp;
 }
 
+/* Finalize output: for stdout, force single-file NIfTI-1 and set names to "-";
+   otherwise set the output filename. Then write. Returns 0 on success. */
 static int write_result(nifti_image *out, const char *output_name, int isStdOut) {
 	if (isStdOut) {
 		free(out->fname); out->fname = nifti_strdup("-");
