@@ -347,6 +347,20 @@ static inline void transposeXZ(float *in, float *out, int *nxp, int ny, int *nzp
 
 /* Blur the leading dimension (length nx) of ny contiguous rows. sigma in mm.
    Returns 0 on success, 1 on allocation failure. */
+/* Blur one contiguous row: full symmetric contiguous kernel (kc[i], not k[abs(i)]) with the
+   interior/border split, so clang auto-vectorizes the interior reduction (NEON). ~1e-6 reassociation
+   vs the old scalar loop; the coreg_fast pyramid tolerates it (real-pair Hellinger unchanged to
+   +/-0.002 on the allineate benchmark). Mirrors niimath coreFLT.c blur_row. */
+static void blur_row(const float *tmp, float *row, int nx, int cutoffvox, const float *kc,
+                     const int *kStart, const int *kEnd, const float *kWeight) {
+    int xlo = MIN(cutoffvox, nx);
+    int xhi = MAX(nx - cutoffvox, xlo);
+    int x = 0;
+    for (; x < xlo; x++) { float sum=0.0f; for (int i=kStart[x];i<=kEnd[x];i++) sum+=tmp[x+i]*kc[i]; row[x]=sum*kWeight[x]; }
+    for (; x < xhi; x++) { float sum=0.0f; for (int i=-cutoffvox;i<=cutoffvox;i++) sum+=tmp[x+i]*kc[i]; row[x]=sum*kWeight[x]; }
+    for (; x < nx;  x++) { float sum=0.0f; for (int i=kStart[x];i<=kEnd[x];i++) sum+=tmp[x+i]*kc[i]; row[x]=sum*kWeight[x]; }
+}
+
 static int smooth_gauss_blur1d(float *img, int nx, int ny, float xmm, float sigma_mm,
                                float kernelWid, int parallel) {
     if (xmm == 0.0f || nx < 2 || ny < 1 || sigma_mm <= 0.0f) return 0;
@@ -367,6 +381,10 @@ static int smooth_gauss_blur1d(float *img, int nx, int ny, float xmm, float sigm
     }
     float expd = 2.0f * sigma * sigma;
     for (int i = 0; i <= cutoffvox; i++) k[i] = expf(-1.0f * (i * i) / expd);
+    float *kfull = (float *)malloc((size_t)(2*cutoffvox+1)*sizeof(float));
+    if (!kfull){ free(k);free(kStart);free(kEnd);free(kWeight); return 1; }
+    for (int i=-cutoffvox;i<=cutoffvox;i++) kfull[cutoffvox+i]=k[abs(i)];
+    const float *kc = kfull + cutoffvox;
     for (int i = 0; i < nx; i++) {
         kStart[i] = MAX(-cutoffvox, -i);
         kEnd[i]   = MIN(cutoffvox, nx - i - 1);
@@ -400,11 +418,7 @@ static int smooth_gauss_blur1d(float *img, int nx, int ny, float xmm, float sigm
                     float *tmp = scratch[omp_get_thread_num()];
                     float *row = img + (size_t)nx * y;
                     memcpy(tmp, row, (size_t)nx * sizeof(float));
-                    for (int x = 0; x < nx; x++) {
-                        float sum = 0.0f;
-                        for (int i = kStart[x]; i <= kEnd[x]; i++) sum += tmp[x + i] * k[abs(i)];
-                        row[x] = sum * kWeight[x];
-                    }
+                    blur_row(tmp, row, nx, cutoffvox, kc, kStart, kEnd, kWeight);
                 }
             }
             for (int t = 0; t < nthreads; t++) free(scratch[t]);
@@ -421,17 +435,13 @@ static int smooth_gauss_blur1d(float *img, int nx, int ny, float xmm, float sigm
             float *row = img;
             for (int y = 0; y < ny; y++) {
                 memcpy(tmp, row, (size_t)nx * sizeof(float));
-                for (int x = 0; x < nx; x++) {
-                    float sum = 0.0f;
-                    for (int i = kStart[x]; i <= kEnd[x]; i++) sum += tmp[x + i] * k[abs(i)];
-                    row[x] = sum * kWeight[x];
-                }
+                blur_row(tmp, row, nx, cutoffvox, kc, kStart, kEnd, kWeight);
                 row += nx;
             }
             free(tmp);
         }
     }
-    free(k); free(kStart); free(kEnd); free(kWeight);
+    free(k); free(kfull); free(kStart); free(kEnd); free(kWeight);
     return failed;
 }
 

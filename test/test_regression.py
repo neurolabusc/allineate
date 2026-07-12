@@ -2,10 +2,11 @@
 """Deterministic regression suite for allineate — a real pass/fail release gate.
 
 Unlike `benchmark/benchmark.py` (speed/quality on the bundled shareable scans, descriptive
-only), this suite builds **synthetic** fixtures on the fly and asserts *correctness* of the
-geometry/preprocessing/affine paths. It exits **nonzero** on any failure, so CI or a release
-script can gate on it. The fast-engine capture recovery (§7) is complemented by the broader
-11-case template-based suite in `test/test_coreg_fast.py`, which `make test` also runs.
+only), this suite asserts *correctness* of the geometry/preprocessing/affine paths using generated
+fixtures plus two known-transform fixtures derived from the bundled non-subject MNI atlas. It exits
+**nonzero** on any failure, so CI or a release script can gate on it. The fast-engine capture
+recovery (§7) is complemented by the broader generated capture suite in
+`test/test_coreg_fast.py`, which `make test` also runs.
 
 Covered (each an audit-hardened path):
   1. non-finite `-com`        — NaN/+Inf must not fold NaN into sform/qform
@@ -15,8 +16,8 @@ Covered (each an audit-hardened path):
   5. `-symb` axis-aligned tie — the world frame wins; sform/qform codes are preserved
   6. degenerate sform+qform   — a qform-only-usable image registers (end-to-end reader repair)
   7. fast engine recovery     — synthetic capture + option rejection + `-cmass/-nocmass` + p1==pN
-  8. cross-modal recovery     — box-weight/Hellinger guard (inverted-contrast fixture) + bit-identity
-  9. revoxelized recovery     — moving resampled onto a different grid, known affine, all engines
+  8. cross-modal recovery     — atlas-derived pseudo-T2, known affine + bit-identity
+  9. revoxelized recovery     — atlas-derived anisotropic/partial-FOV fast fixture + legacy engines
  10. `-master` output grid    — reslice onto a finer grid == `-savemat`+`-applymat` (both engines)
  11. fast CMASS controls      — default/forced COM recover; forced header start does not
  12. padded shift capture     — ordinary engine reaches an AFNI-style >70 mm translation bound
@@ -72,6 +73,59 @@ def save(data, affine, path, code=1, sform=True, qform=True, dtype=np.float32,
         img.header['scl_slope'] = scl_slope
         img.header['scl_inter'] = 0.0 if scl_inter is None else scl_inter
     nib.save(img, path)
+
+
+def trilerp(vol, ci, cj, ck):
+    """Trilinear sampling with zero outside the source FOV (numpy+nibabel-only gate)."""
+    n0, n1, n2 = vol.shape
+    i0 = np.floor(ci).astype(int)
+    j0 = np.floor(cj).astype(int)
+    k0 = np.floor(ck).astype(int)
+    di, dj, dk = ci - i0, cj - j0, ck - k0
+    out = np.zeros(ci.shape, np.float32)
+    for oi, wi in ((0, 1 - di), (1, di)):
+        for oj, wj in ((0, 1 - dj), (1, dj)):
+            for ok, wk in ((0, 1 - dk), (1, dk)):
+                a, b, c = i0 + oi, j0 + oj, k0 + ok
+                valid = (a >= 0) & (a < n0) & (b >= 0) & (b < n1) & (c >= 0) & (c < n2)
+                out += (wi * wj * wk * valid) * vol[np.clip(a, 0, n0 - 1),
+                                                      np.clip(b, 0, n1 - 1),
+                                                      np.clip(c, 0, n2 - 1)]
+    return out
+
+
+def resample_known_affine(data, fixed_affine, truth, target_shape, target_affine):
+    """Create moving data on target grid with exact FIXED->MOVING world transform `truth`."""
+    gi, gj, gk = np.mgrid[0:target_shape[0], 0:target_shape[1], 0:target_shape[2]]
+    moving_to_fixed_index = np.linalg.inv(fixed_affine) @ np.linalg.inv(truth) @ target_affine
+    fixed_index = moving_to_fixed_index @ np.stack(
+        [gi.ravel(), gj.ravel(), gk.ravel(), np.ones(gi.size)])
+    return trilerp(data, fixed_index[0], fixed_index[1], fixed_index[2]).reshape(target_shape)
+
+
+def rotation(axis, degrees):
+    c, s = np.cos(np.radians(degrees)), np.sin(np.radians(degrees))
+    out = np.eye(4)
+    if axis == 0:
+        out[1, 1], out[1, 2], out[2, 1], out[2, 2] = c, -s, s, c
+    elif axis == 1:
+        out[0, 0], out[0, 2], out[2, 0], out[2, 2] = c, s, -s, c
+    else:
+        out[0, 0], out[0, 1], out[1, 0], out[1, 1] = c, -s, s, c
+    return out
+
+
+def translation(xyz):
+    out = np.eye(4)
+    out[:3, 3] = xyz
+    return out
+
+
+def masked_rms_displacement(estimate, truth, world_points):
+    """RMS transform error at actual brain-mask world coordinates."""
+    delta = ((estimate[:3, :3] - truth[:3, :3]) @ world_points +
+             (estimate[:3, 3] - truth[:3, 3])[:, None])
+    return float(np.sqrt(np.mean(np.sum(delta * delta, axis=0))))
 
 
 def main():
@@ -355,14 +409,13 @@ def main():
               p.returncode == 0 and metae.get("dof") == 12 and metae.get("cost") == "hel" and same,
               f"rc={p.returncode} dof={metae.get('dof')} cost={metae.get('cost')} same={same}")
 
-        # 8. Cross-modal recovery — the guard for the box-weight/Hellinger changes to the allineate
-        #    DEFAULT (AL_NPT_MATCH_MIN, binary box weight, topclip membership, live sample clips)
-        #    AND for -cost fast. A moving image with INVERTED, nonlinear contrast vs the fixed (a
-        #    T1<->T2 proxy: bright<->dark; least-squares/CR would fail, Hellinger + the box weight
-        #    recover it) is warped by a known affine A. The loose ERMS/det bounds catch the
-        #    overlap-shrink / wrong-scale failures the box weight fixed, while tolerating MI's
-        #    lower precision on smooth phantoms.
-        print("8. cross-modal recovery (allineate + -cost fast) + -cost fast bit-identity")
+        # 8. Cross-modal recovery. Keep the compact inverted-contrast fixture for the ordinary
+        #    engine's box-weight/Hellinger regression, where it is stable. The fast engine instead
+        #    uses real atlas anatomy transformed into deterministic pseudo-T2 contrast, physically
+        #    re-acquired on a different grid, and scored at actual brain-mask world coordinates.
+        #    This preserves known affine ground truth without the smooth-blob cost surface whose
+        #    neighboring optima changed by several millimetres after benign SIMD reassociation.
+        print("8. cross-modal known-affine recovery + -cost fast bit-identity")
         m = 64; msp = 2.0
         mzz, myy, mxx = np.mgrid[0:m, 0:m, 0:m]
         def _cb(cx, cy, cz, r, a):
@@ -377,42 +430,79 @@ def main():
         ximg = nib.Nifti1Image(xinv, Sxm)
         ximg.header.set_sform(Sxm, code=1); ximg.header.set_qform(Sxm, code=0)
         ximg.set_data_dtype(np.float32); nib.save(ximg, j("xm_mov.nii.gz"))
-        for eng, flag, bound in (("allineate", [], 2.5), ("cost fast", ["-cost", "fast"], 3.5)):
-            xj = j(f"xm_{eng.replace(' ', '_')}.json")   # per-engine path: a stale matrix from a
-            xo = j(f"xm_{eng.replace(' ', '_')}.nii.gz")  # prior engine must not satisfy this check
-            rc, err = run(exe, [j("xm_mov.nii.gz"), j("xm_fix.nii.gz"), *flag, "-savemat", xj, xo])
-            ok = rc == 0 and os.path.exists(xj)
-            check(f"cross-modal {eng}: exit 0 + savemat", ok, f"rc={rc}: {err.strip()[-120:]}")
-            if ok:
-                M = np.array(_json.load(open(xj))["fixed_to_moving"])
-                e = _erms(M, Ax); dt = float(np.linalg.det(M[:3, :3]))
-                check(f"cross-modal {eng}: ERMS {e:.2f} <= {bound} mm (no shrink)", e <= bound, f"ERMS={e:.2f}")
-                check(f"cross-modal {eng}: det {dt:.2f} in [0.7,1.4]", 0.7 <= dt <= 1.4, f"det={dt:.2f}")
-        # -cost fast bit-identity across thread counts (guards the chunked-reduction determinism)
-        run(exe, [j("xm_mov.nii.gz"), j("xm_fix.nii.gz"), "-cost", "fast", "-p", "1", "-savemat", j("xh1.json"), j("xo.nii.gz")])
-        run(exe, [j("xm_mov.nii.gz"), j("xm_fix.nii.gz"), "-cost", "fast", "-p", "4", "-savemat", j("xh4.json"), j("xo.nii.gz")])
+        xj = j("xm_allineate.json")
+        xo = j("xm_allineate.nii.gz")
+        # fast is the default cost; -cost hel selects the ordinary AFNI-style engine this test targets.
+        rc, err = run(exe, [j("xm_mov.nii.gz"), j("xm_fix.nii.gz"), "-cost", "hel", "-savemat", xj, xo])
+        ok = rc == 0 and os.path.exists(xj)
+        check("cross-modal allineate: exit 0 + savemat", ok, f"rc={rc}: {err.strip()[-120:]}")
+        if ok:
+            M = np.array(_json.load(open(xj))["fixed_to_moving"])
+            e = _erms(M, Ax); dt = float(np.linalg.det(M[:3, :3]))
+            check("cross-modal allineate: ERMS <= 2.5 mm (no shrink)", e <= 2.5, f"ERMS={e:.2f}")
+            check("cross-modal allineate: det in [0.7,1.4]", 0.7 <= dt <= 1.4, f"det={dt:.2f}")
+        atlas_path = os.path.join(ROOT, "benchmark", "templates", "avg152T1.nii.gz")
+        atlas_mask_path = os.path.join(ROOT, "benchmark", "masks", "avg152T1_brain_mask.nii.gz")
+        atlas_img = nib.load(atlas_path)
+        atlas_mask_img = nib.load(atlas_mask_path)
+        atlas = np.asarray(atlas_img.dataobj, dtype=np.float32)
+        atlas_mask = np.asarray(atlas_mask_img.dataobj, dtype=np.float32) > 0.5
+        Sa = atlas_img.affine.astype(np.float64)
+        check("atlas fixture grid and mask agree",
+              atlas.shape == atlas_mask.shape and np.allclose(Sa, atlas_mask_img.affine),
+              f"atlas={atlas.shape} mask={atlas_mask.shape}")
+        ai, aj, ak = np.mgrid[0:atlas.shape[0], 0:atlas.shape[1], 0:atlas.shape[2]]
+        atlas_world = Sa @ np.stack([ai.ravel(), aj.ravel(), ak.ravel(), np.ones(ai.size)])
+        brain_world = atlas_world[:3, atlas_mask.ravel()]
+        center = (Sa @ np.r_[(np.asarray(atlas.shape) - 1.0) * 0.5, 1.0])[:3]
+        lo, hi = np.percentile(atlas[atlas_mask], [1, 99])
+        norm = np.clip((atlas - lo) / (hi - lo), 0.0, 1.0)
+        wx = atlas_world[0].reshape(atlas.shape) / 100.0
+        wy = atlas_world[1].reshape(atlas.shape) / 120.0
+        wz = atlas_world[2].reshape(atlas.shape)
+        bias = 1.0 + 0.12 * wx - 0.08 * wy + 0.05 * np.sin(wz / 25.0)
+        rng = np.random.default_rng(20260712)
+        pseudo_t2 = atlas_mask * bias * (20.0 + 180.0 * np.power(1.0 - norm, 1.35))
+        pseudo_t2 += atlas_mask * rng.normal(0.0, 1.5, atlas.shape)
+        pseudo_t2 = pseudo_t2.astype(np.float32)
+        Axa = (translation([6.0, -5.0, 4.0]) @ translation(center) @ rotation(2, 6.0) @
+               rotation(1, -4.0) @ rotation(0, 5.0) @ np.diag([1.03, 0.98, 1.02, 1.0]) @
+               translation(-center))
+        xshape = (80, 92, 68)
+        Sxa = np.diag([-2.4, 2.4, 2.8, 1.0])
+        Sxa[:3, 3] = center - Sxa[:3, :3] @ ((np.asarray(xshape) - 1.0) * 0.5)
+        xmov = resample_known_affine(pseudo_t2, Sa, Axa, xshape, Sxa)
+        save(atlas, Sa, j("xa_fix.nii.gz"))
+        save(xmov, Sxa, j("xa_mov.nii.gz"))
+        xaj = j("xa_fast.json")
+        rc, err = run(exe, [j("xa_mov.nii.gz"), j("xa_fix.nii.gz"), "-cost", "fast",
+                            "-savemat", xaj, j("xa_fast.nii.gz")])
+        ok = rc == 0 and os.path.exists(xaj)
+        check("atlas cross-modal cost fast: exit 0 + savemat", ok,
+              f"rc={rc}: {err.strip()[-120:]}")
+        if ok:
+            M = np.array(_json.load(open(xaj))["fixed_to_moving"])
+            e = masked_rms_displacement(M, Axa, brain_world)
+            ratio = float(np.linalg.det(M[:3, :3]) / np.linalg.det(Axa[:3, :3]))
+            check("atlas cross-modal cost fast: brain RMS <= 2.0 mm", e <= 2.0,
+                  f"brain RMS={e:.3f} mm")
+            check("atlas cross-modal cost fast: determinant within 10% of truth",
+                  0.9 <= ratio <= 1.1, f"det ratio={ratio:.3f}")
+        # Strict within-build thread-count identity remains a separate requirement from the
+        # cross-build accuracy tolerance above.
+        run(exe, [j("xa_mov.nii.gz"), j("xa_fix.nii.gz"), "-cost", "fast", "-p", "1",
+                  "-savemat", j("xh1.json"), j("xo.nii.gz")])
+        run(exe, [j("xa_mov.nii.gz"), j("xa_fix.nii.gz"), "-cost", "fast", "-p", "4",
+                  "-savemat", j("xh4.json"), j("xo.nii.gz")])
         bid = (os.path.exists(j("xh1.json")) and os.path.exists(j("xh4.json")) and
                np.abs(np.array(_json.load(open(j("xh1.json")))["fixed_to_moving"]) -
                       np.array(_json.load(open(j("xh4.json")))["fixed_to_moving"])).max() == 0)
         check("-cost fast bit-identical p1 vs p4", bid, "matrices differ across thread counts")
 
-        # 9. Physically-revoxelized recovery — the moving image is RESAMPLED onto a DIFFERENT grid
-        #    (68^3 @ 1.7 mm, shifted origin) than the fixed (60^3 @ 2 mm) through a known world
-        #    affine A. Unlike the header-trick fixtures (§7/§8, same lattice), this exercises
-        #    fractional sampling / unequal resolution+FOV+origin. Asserts fixed->moving recovery ~ A
-        #    for allineate / -cost fastcr / -cost fast. Trilinear is hand-rolled to keep the gate numpy+nibabel-only.
+        # 9. Physically-revoxelized recovery. Retain the compact generated fixture for the stable
+        #    ordinary and CR engines. The HEL fast path gets a sharper atlas-derived fixture with
+        #    anisotropic voxels, shifted origin, and cropped FOV, again with exact affine truth.
         print("9. physically-revoxelized recovery (different grid, known affine)")
-        def _trilerp(vol, ci, cj, ck):
-            n0, n1, n2 = vol.shape
-            i0 = np.floor(ci).astype(int); j0 = np.floor(cj).astype(int); k0 = np.floor(ck).astype(int)
-            di = ci - i0; dj = cj - j0; dk = ck - k0; out = np.zeros(ci.shape, np.float32)
-            for oi, wi in ((0, 1-di), (1, di)):
-                for oj, wj in ((0, 1-dj), (1, dj)):
-                    for ok, wk in ((0, 1-dk), (1, dk)):
-                        a = i0+oi; b = j0+oj; c = k0+ok
-                        v = (a >= 0)&(a < n0)&(b >= 0)&(b < n1)&(c >= 0)&(c < n2)
-                        out += (wi*wj*wk*v) * vol[np.clip(a,0,n0-1), np.clip(b,0,n1-1), np.clip(c,0,n2-1)]
-            return out
         nrf = 60; srf = 2.0
         ri, rj, rk = np.mgrid[0:nrf, 0:nrf, 0:nrf]
         def _rb(ci, cj, ck, r, a): return a*np.exp(-(((ri-ci)**2+(rj-cj)**2+(rk-ck)**2)/(2.0*r*r)))
@@ -426,10 +516,11 @@ def main():
         Mrs = np.linalg.inv(S1r) @ np.linalg.inv(Ar) @ S2r  # moving idx -> fixed idx
         gi, gj, gk = np.mgrid[0:nrm, 0:nrm, 0:nrm]
         fv = Mrs @ np.stack([gi.ravel(), gj.ravel(), gk.ravel(), np.ones(gi.size)])
-        rmov = _trilerp(rfix, fv[0], fv[1], fv[2]).reshape(nrm, nrm, nrm)
+        rmov = trilerp(rfix, fv[0], fv[1], fv[2]).reshape(nrm, nrm, nrm)
         rimg = nib.Nifti1Image(rmov, S2r); rimg.header.set_sform(S2r, code=1); rimg.header.set_qform(S2r, code=0)
         rimg.set_data_dtype(np.float32); nib.save(rimg, j("rv_mov.nii.gz"))
-        for eng, flag, bound in (("allineate", [], 2.5), ("cost fastcr", ["-cost", "fastcr"], 2.5), ("cost fast", ["-cost", "fast"], 5.0)):
+        for eng, flag, bound in (("allineate", ["-cost", "hel"], 2.5),
+                                 ("cost fastcr", ["-cost", "fastcr"], 2.5)):
             rj = j(f"rv_{eng.replace(' ', '_')}.json")    # per-engine: no stale matrix carryover
             ro = j(f"rv_{eng.replace(' ', '_')}.nii.gz")
             rc, err = run(exe, [j("rv_mov.nii.gz"), j("rv_fix.nii.gz"), *flag, "-savemat", rj, ro])
@@ -438,6 +529,30 @@ def main():
             if ok:
                 e = _erms(np.array(_json.load(open(rj))["fixed_to_moving"]), Ar)
                 check(f"revoxelized {eng}: ERMS {e:.2f} <= {bound} mm", e <= bound, f"ERMS={e:.2f}")
+
+        Ara = (translation([5.0, -4.0, 3.0]) @ translation(center) @ rotation(2, 5.0) @
+               rotation(1, -3.0) @ rotation(0, 4.0) @ np.diag([1.02, 0.99, 1.01, 1.0]) @
+               translation(-center))
+        rashape = (74, 88, 58)
+        Sra = np.diag([-2.3, 2.3, 3.0, 1.0])
+        Sra[:3, 3] = (center - Sra[:3, :3] @ ((np.asarray(rashape) - 1.0) * 0.5) +
+                       np.array([2.0, -3.0, 5.0]))
+        ramov = resample_known_affine(atlas, Sa, Ara, rashape, Sra)
+        save(ramov, Sra, j("ra_mov.nii.gz"))
+        raj = j("ra_fast.json")
+        rc, err = run(exe, [j("ra_mov.nii.gz"), j("xa_fix.nii.gz"), "-cost", "fast",
+                            "-savemat", raj, j("ra_fast.nii.gz")])
+        ok = rc == 0 and os.path.exists(raj)
+        check("atlas revoxelized cost fast: exit 0 + savemat", ok,
+              f"rc={rc}: {err.strip()[-120:]}")
+        if ok:
+            M = np.array(_json.load(open(raj))["fixed_to_moving"])
+            e = masked_rms_displacement(M, Ara, brain_world)
+            ratio = float(np.linalg.det(M[:3, :3]) / np.linalg.det(Ara[:3, :3]))
+            check("atlas revoxelized cost fast: brain RMS <= 1.5 mm", e <= 1.5,
+                  f"brain RMS={e:.3f} mm")
+            check("atlas revoxelized cost fast: determinant within 10% of truth",
+                  0.9 <= ratio <= 1.1, f"det ratio={ratio:.3f}")
 
         # 10. -master output-grid override: register at the stationary resolution but reslice
         #     the result onto a DIFFERENT grid sharing the fixed world frame (e.g. a higher-res
