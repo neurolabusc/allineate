@@ -305,11 +305,9 @@ int nifti_robustfov(nifti_image *nim, double fovmm) {
 }
 
 /*==========================================================================*/
-/* Gaussian blur — clean-room-permitted port of niimath coreFLT.c            */
-/* (nifti_smooth_gauss / blurS / blurP / transposeXY / transposeXZ), BSD/    */
-/* public-domain (NOT src/GPL/). Adapted to operate on a raw float buffer +  */
-/* explicit dims/pixdim instead of a nifti_image; flt->float; printfx->      */
-/* stderr; sigma passed in mm (per axis). Clean-room BSD port, see AGENTS.md.            */
+/* Gaussian blur — float32 typed backend from niimath coreFLT.c.             */
+/* Standalone adaptations are limited to flt->float, xmemcpy->memcpy, and    */
+/* niimath's shared nii_mul_size->the local checked mc_mul helper.           */
 /*==========================================================================*/
 
 #if defined(_OPENMP)
@@ -321,7 +319,7 @@ int nifti_robustfov(nifti_image *nim, double fovmm) {
 #endif
 
 /* transpose X<->Y (rows<->columns) of an nx*ny*nz volume into out */
-static inline void mcf_transposeXY(float *in, float *out, int *nxp, int *nyp, int nz) {
+static inline void transposeXY(float *in, float *out, int *nxp, int *nyp, int nz) {
     int nx = *nxp, ny = *nyp;
     size_t vi = 0;
     for (int z = 0; z < nz; z++) {
@@ -335,7 +333,7 @@ static inline void mcf_transposeXY(float *in, float *out, int *nxp, int *nyp, in
 }
 
 /* transpose X<->Z (slices<->columns) of an nx*ny*nz volume into out */
-static inline void mcf_transposeXZ(float *in, float *out, int *nxp, int ny, int *nzp) {
+static inline void transposeXZ(float *in, float *out, int *nxp, int ny, int *nzp) {
     int nx = *nxp, nz = *nzp, nyz = ny * nz;
     size_t vi = 0;
     for (int z = 0; z < nz; z++) {
@@ -349,8 +347,8 @@ static inline void mcf_transposeXZ(float *in, float *out, int *nxp, int ny, int 
 
 /* Blur the leading dimension (length nx) of ny contiguous rows. sigma in mm.
    Returns 0 on success, 1 on allocation failure. */
-static int mcf_blur1d(float *img, int nx, int ny, float xmm, float sigma_mm,
-                      float kernelWid, int parallel) {
+static int smooth_gauss_blur1d(float *img, int nx, int ny, float xmm, float sigma_mm,
+                               float kernelWid, int parallel) {
     if (xmm == 0.0f || nx < 2 || ny < 1 || sigma_mm <= 0.0f) return 0;
     float sigma = sigma_mm / xmm;   /* mm -> voxels */
     /* Samples beyond the row ends can never contribute. Capping before conversion
@@ -437,41 +435,24 @@ static int mcf_blur1d(float *img, int nx, int ny, float xmm, float sigma_mm,
     return failed;
 }
 
-int mcf_smooth_gauss(float *data, int nx, int ny, int nz,
-                     float dx, float dy, float dz,
-                     float sigX_mm, float sigY_mm, float sigZ_mm, float kernelWid) {
-    if (!data || nx < 1 || ny < 1 || nz < 1) return 1;
-    size_t nvox3D;
-    if (mc_mul((size_t)nx * ny, (size_t)nz, &nvox3D)) return 1;
-    if (nvox3D < 2) return 1;
-    /* Precondition: the spatial product nx*ny*nz must fit in a signed int. The
-       blur/transpose helpers (mcf_blur1d's row count, mcf_transposeXY/XZ's
-       `z*nx*ny` offset) use int row products, so a larger-but-valid volume would
-       overflow them. One boundary check here; no per-loop checks below. */
-    if (nvox3D > (size_t)INT_MAX) {
-        fprintf(stderr, "mcf_smooth_gauss: nx*ny*nz (%zu) exceeds INT_MAX\n", nvox3D);
-        return 1;
-    }
-    if (sigX_mm <= 0.0f && sigY_mm <= 0.0f && sigZ_mm <= 0.0f) return 0;
-#if defined(_OPENMP)
-    int parallel = (omp_get_max_threads() > 1);
-#else
-    int parallel = 0;
-#endif
+static int smooth_gauss_volume(float *data, int nx, int ny, int nz,
+                               float dx, float dy, float dz,
+                               float sigX_mm, float sigY_mm, float sigZ_mm,
+                               float kernelWid, size_t nvox3D, int parallel) {
     /* Blur X: rows are already contiguous. */
     if (sigX_mm > 0.0f && nx >= 2) {
         size_t nRow = (size_t)ny * nz;
-        if (mcf_blur1d(data, nx, (int)nRow, dx, sigX_mm, kernelWid, parallel)) return 1;
+        if (smooth_gauss_blur1d(data, nx, (int)nRow, dx, sigX_mm, kernelWid, parallel)) return 1;
     }
     /* Blur Y: transpose XY, blur leading (now Y) dim, transpose back. */
     if (sigY_mm > 0.0f && ny >= 2) {
         float *t = (float *)malloc(nvox3D * sizeof(float));
         if (!t) return 1;
         int tx = nx, ty = ny;
-        mcf_transposeXY(data, t, &tx, &ty, nz);          /* t is ny*nx*nz */
-        int rc = mcf_blur1d(t, ny, nx * nz, dy, sigY_mm, kernelWid, parallel);
+        transposeXY(data, t, &tx, &ty, nz);          /* t is ny*nx*nz */
+        int rc = smooth_gauss_blur1d(t, ny, nx * nz, dy, sigY_mm, kernelWid, parallel);
         int bx = ny, by = nx;
-        mcf_transposeXY(t, data, &bx, &by, nz);          /* back to nx*ny*nz */
+        transposeXY(t, data, &bx, &by, nz);          /* back to nx*ny*nz */
         free(t);
         if (rc) return 1;
     }
@@ -480,12 +461,55 @@ int mcf_smooth_gauss(float *data, int nx, int ny, int nz,
         float *t = (float *)malloc(nvox3D * sizeof(float));
         if (!t) return 1;
         int tx = nx, tz = nz;
-        mcf_transposeXZ(data, t, &tx, ny, &tz);          /* t is nz*ny*nx */
-        int rc = mcf_blur1d(t, nz, nx * ny, dz, sigZ_mm, kernelWid, parallel);
+        transposeXZ(data, t, &tx, ny, &tz);          /* t is nz*ny*nx */
+        int rc = smooth_gauss_blur1d(t, nz, nx * ny, dz, sigZ_mm, kernelWid, parallel);
         int bx = nz, bz = nx;
-        mcf_transposeXZ(t, data, &bx, ny, &bz);          /* back to nx*ny*nz */
+        transposeXZ(t, data, &bx, ny, &bz);          /* back to nx*ny*nz */
         free(t);
         if (rc) return 1;
+    }
+    return 0;
+}
+
+/* Typed raw-buffer backend copied from niimath coreFLT.c. Sigma values are
+   millimetres; a negative kernel width selects a rounded rather than ceiled
+   radius. Volumes are independent and stored contiguously in NIfTI order. */
+int nifti_smooth_gauss_f32(float *data, int nx, int ny, int nz, int nvol,
+                           float dx, float dy, float dz,
+                           float sigma_x_mm, float sigma_y_mm, float sigma_z_mm,
+                           float kernel_width) {
+    if (!data || (nx < 1) || (ny < 1) || (nz < 1) || (nvol < 1))
+        return 1;
+    size_t nxy;
+    size_t nvox3D;
+    size_t nvox;
+    if (mc_mul((size_t)nx, (size_t)ny, &nxy) ||
+        mc_mul(nxy, (size_t)nz, &nvox3D) ||
+        mc_mul(nvox3D, (size_t)nvol, &nvox) ||
+        (nvox3D < 2) || (nvox3D > (size_t)INT_MAX) ||
+        (nvox > (SIZE_MAX / sizeof(float))))
+        return 1;
+    if ((sigma_x_mm <= 0.0f) && (sigma_y_mm <= 0.0f) && (sigma_z_mm <= 0.0f))
+        return 0;
+#if defined(_OPENMP)
+    int parallel = omp_get_max_threads() > 1;
+    if (parallel && (nvol > 1)) {
+        int failed = 0;
+#pragma omp parallel for reduction(|:failed)
+        for (int v = 0; v < nvol; v++)
+            failed |= smooth_gauss_volume(data + ((size_t)v * nvox3D), nx, ny, nz,
+                                           dx, dy, dz, sigma_x_mm, sigma_y_mm, sigma_z_mm,
+                                           kernel_width, nvox3D, 0);
+        return failed;
+    }
+#else
+    int parallel = 0;
+#endif
+    for (int v = 0; v < nvol; v++) {
+        if (smooth_gauss_volume(data + ((size_t)v * nvox3D), nx, ny, nz,
+                                dx, dy, dz, sigma_x_mm, sigma_y_mm, sigma_z_mm,
+                                kernel_width, nvox3D, parallel))
+            return 1;
     }
     return 0;
 }

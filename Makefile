@@ -25,8 +25,10 @@ OUT    = allineate
 ZFLAGS = -DHAVE_ZLIB
 ZLIB   = -lz
 ifeq "$(ZSTD)" "1"
-	ZFLAGS += -DHAVE_ZSTD
-	ZLIB   += -lzstd
+	ZSTD_CFLAGS := $(shell pkg-config --cflags libzstd 2>/dev/null)
+	ZSTD_LIBS   := $(shell pkg-config --libs libzstd 2>/dev/null)
+	ZFLAGS += -DHAVE_ZSTD $(ZSTD_CFLAGS)
+	ZLIB   += $(if $(ZSTD_LIBS),$(ZSTD_LIBS),-lzstd)
 endif
 
 # OpenMP flags are platform-specific. Apple Clang needs libomp

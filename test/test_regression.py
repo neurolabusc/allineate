@@ -18,6 +18,9 @@ Covered (each an audit-hardened path):
   8. cross-modal recovery     — box-weight/Hellinger guard (inverted-contrast fixture) + bit-identity
   9. revoxelized recovery     — moving resampled onto a different grid, known affine, all engines
  10. `-master` output grid    — reslice onto a finer grid == `-savemat`+`-applymat` (both engines)
+ 11. fast CMASS controls      — default/forced COM recover; forced header start does not
+ 12. padded shift capture     — ordinary engine reaches an AFNI-style >70 mm translation bound
+ 13. C-API NULL options       — `coreg_fast_estimate(..., NULL, ...)` resolves defaults safely
 
 Usage:  python3 test/test_regression.py [--allineate ./allineate]
 Requires numpy + nibabel (a hard requirement for the gate; missing -> exit 2).
@@ -303,9 +306,20 @@ def main():
         check("coreg -cost fast accepted + savemat records cost=hel", ok,
               f"rc={rc}: {err.strip()[-120:]}")
 
-        # unsupported allineate options are rejected (not silently ignored) by the fast engine
-        for opt in (["-cost", "ls"], ["-warp", "shr"], ["-interp", "cubic"],
-                    ["-source_automask"]):
+        # -cost is last-one-wins, matching niimath's shared parser: a normal cost after
+        # fastcr switches back to the ordinary engine rather than becoming a rejected
+        # fast-engine tuning request.
+        lastj = j("cf_cost_last.json")
+        rc, _ = run(exe, [j("cf_mov_identity.nii.gz"), j("cf_fix.nii.gz"),
+                          "-cost", "fastcr", "-cost", "ls", "-savemat", lastj])
+        last = _json.load(open(lastj)) if rc == 0 and os.path.exists(lastj) else {}
+        check("-cost last-one-wins switches fastcr -> ordinary ls",
+              rc == 0 and last.get("engine") == "allineate" and last.get("cost") == "ls",
+              f"rc={rc} engine={last.get('engine')} cost={last.get('cost')}")
+
+        # Unsupported allineate tuning options are rejected (not silently ignored)
+        # when the final engine selector remains fast.
+        for opt in (["-warp", "shr"], ["-interp", "cubic"], ["-source_automask"]):
             rc, _ = run(exe, [j("cf_mov_identity.nii.gz"), j("cf_fix.nii.gz"),
                               "-cost", "fastcr", *opt, j("cf_rej.nii.gz")])
             check(f"coreg fast rejects {opt[0]} (nonzero exit)", rc != 0, f"rc={rc}")
@@ -484,11 +498,48 @@ def main():
               abs(erms_cm["default"] - erms_cm["cmass"]) < 1e-6,
               f"default={erms_cm['default']:.4f} cmass={erms_cm['cmass']:.4f}")
 
-        # 12. C-API NULL-options contract: coreg_fast_estimate(mov, fix, NULL, &res) must resolve
+        # 12. AFNI padded-shift capture (ordinary engine). The unpadded 112-voxel
+        #     base permits only ~71 mm at 2 mm voxels (0.321*(n-1)*d), while AFNI's
+        #     default content-aware padding expands that range beyond the true 78 mm
+        #     translation. The sharp off-center lobes keep the fixture identifiable and
+        #     extend the content box close enough to the y faces to require padding.
+        print("12. ordinary allineate AFNI-padded shift-range capture")
+        nxp, nyp, nzp, spp = 64, 112, 64, 2.0
+        pi, pj, pk = np.mgrid[0:nxp, 0:nyp, 0:nzp]
+        def _pg(cx, cy, cz, r, a):
+            return a * np.exp(-(((pi-cx)**2 + (pj-cy)**2 + (pk-cz)**2) / (2.0*r*r)))
+        pfix = (_pg(32,56,32,13,100) + _pg(42,43,30,6,180) +
+                _pg(24,70,38,7,80) + _pg(31,7,31,3,140) +
+                _pg(34,104,33,3,120)).astype(np.float32)
+        Sp = np.diag([spp, spp, spp, 1.0])
+        Sp[:3, 3] = [-0.5*(nxp-1)*spp, -0.5*(nyp-1)*spp, -0.5*(nzp-1)*spp]
+        Ap = np.eye(4); Ap[1, 3] = 78.0
+        save(pfix, Sp, j("pad_fix.nii.gz"))
+        save(pfix, Ap @ Sp, j("pad_mov.nii.gz"))
+        rc, err = run(exe, [j("pad_mov.nii.gz"), j("pad_fix.nii.gz"),
+                            "-cost", "ls", "-warp", "sho", "-p", "1",
+                            "-savemat", j("pad.json"), j("pad_out.nii.gz")])
+        ok = rc == 0 and os.path.exists(j("pad.json"))
+        check("ordinary padded-range fit exits 0 + matrix", ok,
+              f"rc={rc}: {err.strip()[-120:]}")
+        if ok:
+            pm1 = np.array(_json.load(open(j("pad.json")))["fixed_to_moving"])
+            pe = _erms(pm1, Ap)
+            check("ordinary padded range recovers 78 mm translation (ERMS < 2 mm)", pe < 2.0,
+                  f"ERMS={pe:.2f}")
+            rc4, err4 = run(exe, [j("pad_mov.nii.gz"), j("pad_fix.nii.gz"),
+                                  "-cost", "ls", "-warp", "sho", "-p", "4",
+                                  "-savemat", j("pad4.json")])
+            same = rc4 == 0 and os.path.exists(j("pad4.json")) and np.array_equal(
+                pm1, np.array(_json.load(open(j("pad4.json")))["fixed_to_moving"]))
+            check("ordinary padded range is bit-identical p1 vs p4", same,
+                  f"rc={rc4}: {err4.strip()[-120:]}")
+
+        # 13. C-API NULL-options contract: coreg_fast_estimate(mov, fix, NULL, &res) must resolve
         #     to defaults and successfully fit a valid identity pair. The CLI always passes
         #     non-NULL, so this is the only path that catches a raw `opts->` read. `make test`
         #     builds the harness; when absent (standalone run) the check is skipped.
-        print("12. C-API NULL-options contract (coreg_fast_estimate)")
+        print("13. C-API NULL-options contract (coreg_fast_estimate)")
         capi = os.path.join(ROOT, "test_capi_nullopts")
         if os.path.exists(capi):
             p = subprocess.run([capi, j("cf_mov_identity.nii.gz"), j("cf_fix.nii.gz")],

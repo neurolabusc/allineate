@@ -257,8 +257,8 @@ static int read_affine_json(const char *path, mat44 *out) {
 /* Parse CLI sub-arguments.
    *ac points to the last positional arg consumed; on return it points to the
    last sub-argument consumed. Returns 0 on success, 1 on error. */
-static int al_parse_subopts(int *ac, int argc, char **argv, al_opts *opts,
-                            const char *cmd_name) {
+static int cli_parse_subopts(int *ac, int argc, char **argv, al_opts *opts,
+                             const char *cmd_name) {
 	while (*ac + 1 < argc && argv[*ac + 1][0] == '-') {
 		(*ac)++;
 		if (!strcmp(argv[*ac], "-p")) {
@@ -281,53 +281,6 @@ static int al_parse_subopts(int *ac, int argc, char **argv, al_opts *opts,
 #else
 			fprintf(stderr, " + -p ignored: built without OpenMP (single-threaded)\n");
 #endif
-		} else if (!strcmp(argv[*ac], "-cmass")) {
-			opts->cmass = AL_CMASS_YES; opts->cli_set |= AL_CLI_CMASS;
-		} else if (!strcmp(argv[*ac], "-nocmass")) {
-			opts->cmass = AL_CMASS_NONE; opts->cli_set |= AL_CLI_CMASS;
-		} else if (!strcmp(argv[*ac], "-source_automask")) {
-			opts->source_automask = 1;
-		} else if (!strcmp(argv[*ac], "-dark_automask")) {
-			opts->dark_automask = 1;
-		} else if (!strcmp(argv[*ac], "-nearest") || !strcmp(argv[*ac], "-NN")) {
-			opts->final_interp = AL_INTERP_NN; opts->cli_set |= AL_CLI_FINAL;
-		} else if (!strcmp(argv[*ac], "-linear") || !strcmp(argv[*ac], "-trilinear")) {
-			opts->final_interp = AL_INTERP_LINEAR; opts->cli_set |= AL_CLI_FINAL;
-		} else if (!strcmp(argv[*ac], "-cubic") || !strcmp(argv[*ac], "-tricubic")) {
-			opts->final_interp = AL_INTERP_CUBIC; opts->cli_set |= AL_CLI_FINAL;
-		} else if (!strcmp(argv[*ac], "-warp")) {
-			(*ac)++;
-			if (*ac >= argc) {
-				fprintf(stderr, "%s -warp requires a type (sho, shr, srs, aff)\n", cmd_name);
-				return 1;
-			}
-			if (al_parse_warp(argv[*ac], &opts->warp)) {
-				fprintf(stderr, "Unknown warp '%s' (use: sho, shr, srs, aff)\n", argv[*ac]);
-				return 1;
-			}
-			opts->cli_set |= AL_CLI_WARP;
-		} else if (!strcmp(argv[*ac], "-interp")) {
-			(*ac)++;
-			if (*ac >= argc) {
-				fprintf(stderr, "%s -interp requires an interpolation name\n", cmd_name);
-				return 1;
-			}
-			if (al_parse_interp(argv[*ac], &opts->interp)) {
-				fprintf(stderr, "Unknown interp '%s' (use: NN, linear, cubic)\n", argv[*ac]);
-				return 1;
-			}
-			opts->cli_set |= AL_CLI_INTERP;
-		} else if (!strcmp(argv[*ac], "-final")) {
-			(*ac)++;
-			if (*ac >= argc) {
-				fprintf(stderr, "%s -final requires an interpolation name\n", cmd_name);
-				return 1;
-			}
-			if (al_parse_interp(argv[*ac], &opts->final_interp)) {
-				fprintf(stderr, "Unknown final interp '%s' (use: NN, linear, cubic)\n", argv[*ac]);
-				return 1;
-			}
-			opts->cli_set |= AL_CLI_FINAL;
 		} else if (!strcmp(argv[*ac], "-skullstrip")) {
 			(*ac)++;
 			if (*ac >= argc) {
@@ -335,38 +288,6 @@ static int al_parse_subopts(int *ac, int argc, char **argv, al_opts *opts,
 				return 1;
 			}
 			opts->skullstrip = argv[*ac];
-		} else if (!strcmp(argv[*ac], "-savemat")) {
-			(*ac)++;
-			if (*ac >= argc) {
-				fprintf(stderr, "%s -savemat requires an output filename (.json)\n", cmd_name);
-				return 1;
-			}
-			opts->savemat = argv[*ac];
-		} else if (!strcmp(argv[*ac], "-applymat")) {
-			(*ac)++;
-			if (*ac >= argc) {
-				fprintf(stderr, "%s -applymat requires a matrix filename (.json from -savemat)\n", cmd_name);
-				return 1;
-			}
-			opts->applymat = argv[*ac];
-		} else if (!strcmp(argv[*ac], "-master")) {
-			(*ac)++;
-			if (*ac >= argc) {
-				fprintf(stderr, "%s -master requires an output-grid image filename\n", cmd_name);
-				return 1;
-			}
-			opts->master = argv[*ac];
-		} else if (!strcmp(argv[*ac], "-com")) {
-			opts->com = 1;
-		} else if (!strcmp(argv[*ac], "-sym")) {
-			opts->sym = 1;
-			opts->sym_deoblique = 0;   /* last-option-wins: -symd -sym runs plain -sym */
-		} else if (!strcmp(argv[*ac], "-symd")) {
-			opts->sym = 1;
-			opts->sym_deoblique = 1;
-		} else if (!strcmp(argv[*ac], "-symb")) {
-			opts->sym = 1;
-			opts->sym_deoblique = 2;   /* auto-compete: best of -sym / -symd */
 		} else if (!strcmp(argv[*ac], "-fast") || !strcmp(argv[*ac], "-fasthel")) {
 			fprintf(stderr, "%s: -fast/-fasthel were replaced by cost selectors — use "
 			                "'-cost fast' (fast engine, Hellinger; robust cross-modal) or "
@@ -376,10 +297,6 @@ static int al_parse_subopts(int *ac, int argc, char **argv, al_opts *opts,
 			fprintf(stderr, "%s: -coreg was replaced by '-cost fast' "
 			                "(allineate is the default; '-cost fast' for the fast engine)\n", cmd_name);
 			return 1;
-		} else if (!strcmp(argv[*ac], "-nosagseed")) {
-			opts->sagseed = 0;
-		} else if (!strcmp(argv[*ac], "-zoom")) {
-			opts->zoom = 1;
 		} else if (!strcmp(argv[*ac], "-robustfov")) {
 			opts->robustfov = 170.0; /* default FOV in mm */
 			if (*ac + 1 < argc) {
@@ -395,29 +312,15 @@ static int al_parse_subopts(int *ac, int argc, char **argv, al_opts *opts,
 					(*ac)++;
 				}
 			}
-		} else if (!strcmp(argv[*ac], "-cost")) {
-			(*ac)++;
-			if (*ac >= argc) {
-				fprintf(stderr, "%s -cost requires a cost function name\n", cmd_name);
-				return 1;
-			}
-			/* Two -cost values select the FAST engine instead of an allineate cost:
-			   'fast' = fast path, Hellinger (robust cross-modal); 'fastcr' = fast path,
-			   correlation-ratio (unstable when modalities differ; for same-modality/synthetic use). They set the
-			   engine, not an allineate cost, so they do NOT set AL_CLI_COST. */
-			if (!strcmp(argv[*ac], "fast")) {
-				opts->fast = AL_ENGINE_FAST_HEL;
-			} else if (!strcmp(argv[*ac], "fastcr")) {
-				opts->fast = AL_ENGINE_FAST_CR;
-			} else if (al_parse_cost(argv[*ac], &opts->cost)) {
-				fprintf(stderr, "Unknown cost function '%s' (use: fast, fastcr, lpc, lpa, hel, ls)\n", argv[*ac]);
-				return 1;
-			} else {
-				opts->cli_set |= AL_CLI_COST;
-			}
 		} else {
+			/* Delegate every shared registration option to the parser copied verbatim
+			   from niimath's allineate.h. Back up to the last consumed argument first. */
 			(*ac)--;
-			break;
+			int before = *ac;
+			if (al_parse_subopts(ac, argc, argv, opts, cmd_name, AL_CAP_ALL))
+				return 1;
+			if (*ac == before)
+				break;  /* unrecognized option: leave it for the positional validator */
 		}
 	}
 	return 0;
@@ -446,7 +349,7 @@ int main(int argc, char * argv[]) {
 	}
 	/* al_parse_subopts wants the index of the last positional consumed. */
 	int pac = ac - 1;
-	if (al_parse_subopts(&pac, argc, argv, &opts, "allineate"))
+	if (cli_parse_subopts(&pac, argc, argv, &opts, "allineate"))
 		return 1;
 	ac = pac + 1;
 	/* The output filename is the remaining positional (may be omitted in matrix-only
@@ -456,7 +359,7 @@ int main(int argc, char * argv[]) {
 	const char *output_name = (ac < argc) ? argv[ac] : NULL;
 	if (output_name && ac + 1 < argc) {
 		int pac2 = ac;   /* points at the output; consumes flags after it */
-		if (al_parse_subopts(&pac2, argc, argv, &opts, "allineate"))
+		if (cli_parse_subopts(&pac2, argc, argv, &opts, "allineate"))
 			return 1;
 		if (pac2 + 1 < argc) {
 			fprintf(stderr, "Unexpected extra argument '%s' after output '%s'\n",

@@ -4,7 +4,8 @@
  * clean-room: never derived from src/GPL/). Owns its parameterization, cost
  * evaluators, level builder, and optimizer orchestration. Reuses only the pure BSD
  * demo helpers: al_image_xform() (sform/qform policy), nii_reslice_affine() (final
- * warp), powell_newuoa() (optimizer), mat44 math, and mcf_smooth_gauss() (blur).
+ * warp), powell_newuoa() (optimizer), mat44 math, and nifti_smooth_gauss_f32()
+ * (the float32 core's raw-buffer Gaussian blur).
  *
  * Serial-only at the host-call level: the NEWUOA cost callback reads a process-
  * global context pointer (g_cf), like the allineate engine's global setup.
@@ -20,8 +21,8 @@
 #include <time.h>
 
 #include "coreg_fast.h"
+#include "core32.h"         /* nifti_smooth_gauss_f32 */
 #include "allineate.h"      /* al_image_xform, nii_reslice_affine, AL_INTERP_* */
-#include "miniCoreFLT.h"    /* mcf_smooth_gauss */
 
 extern int powell_newuoa(int ndim, double *x, double rstart, double rend,
                          int maxcall, double (*ufunc)(int, double *));
@@ -48,17 +49,22 @@ extern void powell_newuoa_free_threadlocal(void);
  * per-level (a handful of calls), never per cost evaluation, so the release build is
  * untouched and even the profiling build adds negligible overhead. The final warp is
  * applied by main.c (nii_apply_affine), so it is NOT part of this estimate profile. */
-#ifdef AL_PROFILE
-static double g_prof_blur = 0.0, g_prof_resample = 0.0;
-/* Wall clock (OpenMP-aware, mirrors allineate.c's al_wtime). */
+/* Wall-clock timer in seconds (OpenMP-aware; mirrors allineate.c's al_wtime, including the
+   Windows fallback so MSVC — which lacks clock_gettime(CLOCK_MONOTONIC) — still links). */
 static inline double cf_wtime(void) {
-#if defined(_OPENMP)
+#ifdef _OPENMP
     return omp_get_wtime();
+#elif defined(_WIN32)
+    return (double)clock() / CLOCKS_PER_SEC; /* fallback: CPU time on Windows without OpenMP */
 #else
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 #endif
 }
+
+#ifdef AL_PROFILE
+static double g_prof_blur = 0.0, g_prof_resample = 0.0;
 #endif
 
 #ifndef M_PI
@@ -259,8 +265,12 @@ static int cf_build_level(const float *src, int snx, int sny, int snz,
     double _tb = cf_wtime();
 #endif
     if (sig > 0.0)
-        if (mcf_smooth_gauss(blur, snx, sny, snz, (float)vx, (float)vy, (float)vz,
-                             (float)sig, (float)sig, (float)sig, -6.0f)) { free(blur); return 1; }
+        if (nifti_smooth_gauss_f32(blur, snx, sny, snz, 1,
+                                   (float)vx, (float)vy, (float)vz,
+                                   (float)sig, (float)sig, (float)sig, -6.0f)) {
+            free(blur);
+            return 1;
+        }
 #ifdef AL_PROFILE
     g_prof_blur += cf_wtime() - _tb;
     double _tr = cf_wtime();
@@ -668,12 +678,14 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
 #ifdef AL_PROFILE
     g_prof_blur = g_prof_resample = 0.0;   /* per-call reset (accumulators are file-global) */
 #endif
-    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    double t0 = cf_wtime();
     if (!moving || !fixed || !result) return 1;
     if (cf_dims_ok(fixed, "fixed") || cf_dims_ok(moving, "moving")) return 1;
     mat44 Sf, Sm;
-    if (al_image_xform(fixed, &Sf))  { fprintf(stderr, "coreg fast: fixed has no valid sform/qform\n");  return 1; }
-    if (al_image_xform(moving, &Sm)) { fprintf(stderr, "coreg fast: moving has no valid sform/qform\n"); return 1; }
+    /* Unified no-form policy (shared with al_register/-sym/-com/apply): coded sform/qform
+       when usable, else a pixdim-centered frame — so both-codes-zero inputs still register. */
+    al_image_xform_or_pixdim(fixed, &Sf, NULL);
+    al_image_xform_or_pixdim(moving, &Sm, NULL);
 
     int fnx=fixed->nx, fny=fixed->ny, fnz=fixed->nz;
     int mnx=moving->nx, mny=moving->ny, mnz=moving->nz;
@@ -701,8 +713,7 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
        other image, so only ONE full-resolution volume is ever held at a time (plus the
        small pyramids and one blur scratch). The moving COM is taken from its full-res
        buffer just before that buffer is freed. */
-    cf_level Lf[3], Lm[3];
-    for (int i=0;i<3;i++){ Lf[i].data=NULL; Lm[i].data=NULL; }
+    cf_level Lf[3] = {{0}}, Lm[3] = {{0}};
     double comm[3];
     int build_ok = 1, have_com_m = 0;
 #ifdef AL_PROFILE
@@ -779,6 +790,10 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
                O.use_cmass==0; `-nocmass` likewise keeps only its supplied frame. */
             double seeds[1][12]; int nseed = 1;
             memset(seeds[0], 0, sizeof seeds[0]);
+            /* NB: the seed CHOICE below must be deterministic across thread counts (the byte-
+               parity contract). It is, because HEL/CR use fixed-order chunked reductions — but
+               cf_cost_eval's LS branch uses reduction(+:) and is NOT thread-stable, so do not
+               wire a future LS caller to use_cmass expecting -p1==-pN seed selection. */
             if (O.use_cmass && have_com_m) {
                 double hp[12] = {0}, cp[12] = {0};
                 cp[0] = comm[0] / CF_PS_TRANS;
@@ -921,8 +936,7 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
     result->levels_completed = levels_done;
     result->resolved_cost = O.cost;      /* validated config actually used */
     result->resolved_dof = ctx.dof_run;  /* highest DOF actually fitted (not the requested cap) */
-    struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
-    result->registration_ms = (t1.tv_sec - t0.tv_sec)*1000.0 + (t1.tv_nsec - t0.tv_nsec)/1.0e6;
+    result->registration_ms = (cf_wtime() - t0) * 1000.0;
 #ifdef AL_PROFILE
     fprintf(stderr, " [coreg profile] TOTAL estimate %.3f s: blur %.3f s, resample %.3f s, "
             "%d evals over %d level(s)  (final warp is applied separately by the caller)\n",

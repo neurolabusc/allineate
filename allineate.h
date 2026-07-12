@@ -36,6 +36,19 @@
 #define AL_CLI_FINAL  0x8u   /* -final / -nearest / -linear / -cubic (OUTPUT interpolation) */
 #define AL_CLI_CMASS  0x10u  /* -cmass / -nocmass */
 
+/* al_parse_subopts capability bits — the set of option GROUPS a command actually implements.
+   Each command passes its capabilities so an option it does not honor is rejected AT PARSE
+   TIME (before images load) rather than silently ignored (the `-deface` silent-no-op bug
+   class). Intra-command mode restrictions (e.g. the fast engine within -allineate rejecting
+   -warp/-sym) are separate and enforced at dispatch. */
+#define AL_CAP_TUNING  0x1u   /* -cost <normal>/-warp/-interp/-cmass/-nocmass/-source_automask/-dark_automask */
+#define AL_CAP_FINAL   0x2u   /* -final / -nearest / -linear / -cubic (output interpolation) */
+#define AL_CAP_FAST    0x4u   /* -cost fast / -cost fastcr (fast engine) */
+#define AL_CAP_MASTER  0x8u   /* -master <grid> */
+#define AL_CAP_MATRIX  0x10u  /* -savemat / -applymat */
+#define AL_CAP_SEED    0x20u  /* -com / -sym / -symd / -symb / -nosagseed / -zoom */
+#define AL_CAP_ALL     (AL_CAP_TUNING|AL_CAP_FINAL|AL_CAP_FAST|AL_CAP_MASTER|AL_CAP_MATRIX|AL_CAP_SEED)
+
 /* Warp type codes (number of free parameters) */
 #define AL_WARP_SHIFT_ONLY          3  /* shift_only / sho: 3 DOF */
 #define AL_WARP_SHIFT_ROTATE        6  /* shift_rotate / shr: 6 DOF */
@@ -58,10 +71,15 @@ typedef struct {
     int interp;            /* AL_INTERP_* for fine-pass matching (default: LINEAR) */
     int final_interp;      /* AL_INTERP_* for output reslicing (default: AL_INTERP_DEFAULT) */
     int warp;              /* AL_WARP_* DOF count (default: AL_WARP_AFFINE_GENERAL = 12) */
-    /* --- CLI-workflow fields below: interpreted by main.c's pre-/post-processing
-       chain, NOT by nii_allineate()/nii_deface(). A direct library caller setting
-       these gets a silent no-op (documented DEFERRED decision — see CLAUDE.md:
-       "DEFERRED splitting al_opts"). Drive these via the CLI, not the API. --- */
+    /* --- CLI-workflow fields below: interpreted by the host's pre-/post-processing chain
+       (niimath's nifti_allineate_wrap in coreFLT.c, and the standalone allineate main.c),
+       NOT by nii_allineate()/nii_deface(); a direct library caller setting those gets a
+       silent no-op. EXCEPTION: `zoom` (bottom of the struct) IS read by nii_allineate()/
+       al_register() as the scale-relaxation flag. These are all wired to CLI flags in both
+       hosts (savemat/applymat/com/sym[/-symd/-symb via sym_deoblique]/sagseed[-nosagseed]/
+       zoom as -allineate sub-options; robustfov is a standalone niimath op; skullstrip = the
+       standalone's flag, provided in niimath by -deface with a brain mask). Splitting the
+       estimator options from CLI state is a possible future refactor. --- */
     const char *skullstrip; /* CLI-only: -skullstrip brain mask (NULL = normal registration) */
     double robustfov;       /* CLI-only: -robustfov crop mm applied to the moving image (0 = off) */
     const char *savemat;    /* CLI-only: -savemat path; main.c saves the fitted affine as JSON
@@ -174,6 +192,156 @@ static inline const char *al_cost_name(int cost) {
     }
 }
 
+/* Parse trailing `-sub` options for a `-allineate`/`-deface` command (e.g.
+   `-allineate base.nii -cost fast -master hires.nii`). Consumes options while the
+   NEXT token starts with '-' and is recognized; stops (backing up) at the first
+   unrecognized token so the outer niimath CLI can continue. Returns 0 on success,
+   1 on a malformed sub-option. Records which overrides the user passed in
+   `opts->cli_set` so a distinct engine (the fast path) can reject what it cannot honor.
+   `caps` is the command's AL_CAP_* capability set: an option outside it is rejected at
+   parse time (`-allineate` passes AL_CAP_ALL; `-deface` passes AL_CAP_TUNING|AL_CAP_FINAL),
+   so a command can never silently accept an option it does not implement. */
+static inline int al_parse_subopts(int *ac, int argc, char **argv, al_opts *opts,
+                                   const char *cmd_name, unsigned caps) {
+    /* Reject an option the command does not implement (parse-time, before images load). */
+#define AL_NEED(bit, opt) do { if (!(caps & (bit))) { \
+        fprintf(stderr, "%s does not support %s\n", cmd_name, (opt)); return 1; } } while (0)
+    while (*ac + 1 < argc && argv[*ac + 1][0] == '-') {
+        (*ac)++;
+        if (!strcmp(argv[*ac], "-cmass")) {
+            AL_NEED(AL_CAP_TUNING, "-cmass");
+            opts->cmass = AL_CMASS_YES; opts->cli_set |= AL_CLI_CMASS;
+        } else if (!strcmp(argv[*ac], "-nocmass")) {
+            AL_NEED(AL_CAP_TUNING, "-nocmass");
+            opts->cmass = AL_CMASS_NONE; opts->cli_set |= AL_CLI_CMASS;
+        } else if (!strcmp(argv[*ac], "-source_automask")) {
+            AL_NEED(AL_CAP_TUNING, "-source_automask");
+            opts->source_automask = 1;
+        } else if (!strcmp(argv[*ac], "-dark_automask")) {
+            AL_NEED(AL_CAP_TUNING, "-dark_automask");
+            opts->dark_automask = 1;
+        } else if (!strcmp(argv[*ac], "-nearest") || !strcmp(argv[*ac], "-NN")) {
+            AL_NEED(AL_CAP_FINAL, "-nearest");
+            opts->final_interp = AL_INTERP_NN; opts->cli_set |= AL_CLI_FINAL;
+        } else if (!strcmp(argv[*ac], "-linear") || !strcmp(argv[*ac], "-trilinear")) {
+            AL_NEED(AL_CAP_FINAL, "-linear");
+            opts->final_interp = AL_INTERP_LINEAR; opts->cli_set |= AL_CLI_FINAL;
+        } else if (!strcmp(argv[*ac], "-cubic") || !strcmp(argv[*ac], "-tricubic")) {
+            AL_NEED(AL_CAP_FINAL, "-cubic");
+            opts->final_interp = AL_INTERP_CUBIC; opts->cli_set |= AL_CLI_FINAL;
+        } else if (!strcmp(argv[*ac], "-warp")) {
+            AL_NEED(AL_CAP_TUNING, "-warp");
+            (*ac)++;
+            if (*ac >= argc) {
+                fprintf(stderr, "%s -warp requires a type (sho, shr, srs, aff)\n", cmd_name);
+                return 1;
+            }
+            if (al_parse_warp(argv[*ac], &opts->warp)) {
+                fprintf(stderr, "Unknown warp '%s' (use: sho, shr, srs, aff)\n", argv[*ac]);
+                return 1;
+            }
+            opts->cli_set |= AL_CLI_WARP;
+        } else if (!strcmp(argv[*ac], "-interp")) {
+            AL_NEED(AL_CAP_TUNING, "-interp");
+            (*ac)++;
+            if (*ac >= argc) {
+                fprintf(stderr, "%s -interp requires an interpolation name\n", cmd_name);
+                return 1;
+            }
+            if (al_parse_interp(argv[*ac], &opts->interp)) {
+                fprintf(stderr, "Unknown interp '%s' (use: NN, linear, cubic)\n", argv[*ac]);
+                return 1;
+            }
+            opts->cli_set |= AL_CLI_INTERP;
+        } else if (!strcmp(argv[*ac], "-final")) {
+            AL_NEED(AL_CAP_FINAL, "-final");
+            (*ac)++;
+            if (*ac >= argc) {
+                fprintf(stderr, "%s -final requires an interpolation name\n", cmd_name);
+                return 1;
+            }
+            if (al_parse_interp(argv[*ac], &opts->final_interp)) {
+                fprintf(stderr, "Unknown final interp '%s' (use: NN, linear, cubic)\n", argv[*ac]);
+                return 1;
+            }
+            opts->cli_set |= AL_CLI_FINAL;
+        } else if (!strcmp(argv[*ac], "-master")) {
+            AL_NEED(AL_CAP_MASTER, "-master");
+            (*ac)++;
+            if (*ac >= argc) {
+                fprintf(stderr, "%s -master requires an output-grid image filename\n", cmd_name);
+                return 1;
+            }
+            opts->master = argv[*ac];
+        } else if (!strcmp(argv[*ac], "-savemat")) {
+            AL_NEED(AL_CAP_MATRIX, "-savemat");
+            (*ac)++;
+            if (*ac >= argc) {
+                fprintf(stderr, "%s -savemat requires an output filename (.json)\n", cmd_name);
+                return 1;
+            }
+            opts->savemat = argv[*ac];
+        } else if (!strcmp(argv[*ac], "-applymat")) {
+            AL_NEED(AL_CAP_MATRIX, "-applymat");
+            (*ac)++;
+            if (*ac >= argc) {
+                fprintf(stderr, "%s -applymat requires a matrix filename (.json from -savemat)\n", cmd_name);
+                return 1;
+            }
+            opts->applymat = argv[*ac];
+        } else if (!strcmp(argv[*ac], "-com")) {
+            AL_NEED(AL_CAP_SEED, "-com");
+            opts->com = 1;
+        } else if (!strcmp(argv[*ac], "-sym")) {
+            AL_NEED(AL_CAP_SEED, "-sym");
+            opts->sym = 1; opts->sym_deoblique = 0;   /* last-option-wins: -symd -sym runs plain -sym */
+        } else if (!strcmp(argv[*ac], "-symd")) {
+            AL_NEED(AL_CAP_SEED, "-symd");
+            opts->sym = 1; opts->sym_deoblique = 1;
+        } else if (!strcmp(argv[*ac], "-symb")) {
+            AL_NEED(AL_CAP_SEED, "-symb");
+            opts->sym = 1; opts->sym_deoblique = 2;   /* auto-compete: best of -sym / -symd */
+        } else if (!strcmp(argv[*ac], "-nosagseed")) {
+            AL_NEED(AL_CAP_SEED, "-nosagseed");
+            opts->sagseed = 0;
+        } else if (!strcmp(argv[*ac], "-zoom")) {
+            AL_NEED(AL_CAP_SEED, "-zoom");
+            opts->zoom = 1;
+        } else if (!strcmp(argv[*ac], "-cost")) {
+            (*ac)++;
+            if (*ac >= argc) {
+                fprintf(stderr, "%s -cost requires a cost function name\n", cmd_name);
+                return 1;
+            }
+            /* Two `-cost` values select the FAST engine rather than an allineate cost:
+               `fast` = Hellinger (robust cross-modal), `fastcr` = correlation-ratio.
+               `-cost` is last-one-wins: a normal cost after `-cost fast` clears the fast
+               engine selection (and vice-versa) so the final `-cost` always decides. */
+            if (!strcmp(argv[*ac], "fast")) {
+                AL_NEED(AL_CAP_FAST, "-cost fast");
+                opts->fast = AL_ENGINE_FAST_HEL;
+            } else if (!strcmp(argv[*ac], "fastcr")) {
+                AL_NEED(AL_CAP_FAST, "-cost fastcr");
+                opts->fast = AL_ENGINE_FAST_CR;
+            } else if (al_parse_cost(argv[*ac], &opts->cost)) {
+                fprintf(stderr, "Unknown cost function '%s' (use: fast, fastcr, lpc, lpa, hel, ls)\n",
+                        argv[*ac]);
+                return 1;
+            } else {
+                AL_NEED(AL_CAP_TUNING, "-cost");
+                opts->fast = 0;   /* normal cost overrides an earlier -cost fast/fastcr */
+                opts->cli_set |= AL_CLI_COST;
+            }
+        } else {
+            /* Not a recognized sub-argument, back up */
+            (*ac)--;
+            break;
+        }
+    }
+    return 0;
+#undef AL_NEED
+}
+
 /* The registration/deface API uses process-global and thread-local workspaces.
    It is safe for serial CLI-style use, but not for concurrent calls. */
 
@@ -186,6 +354,13 @@ static inline const char *al_cost_name(int cost) {
    exact parity holds (a no-logic-change exposure). */
 int al_image_xform(const nifti_image *nim, mat44 *out);
 
+/* Index->world (mm) transform with the single no-form fallback policy: al_image_xform's
+   coded sform/qform selection, else a pixdim-centered frame. The one policy used by every
+   registration/geometry entry point (al_register, coreg_fast, -sym, -com, -sagseed, apply)
+   so both-codes-zero inputs always yield a usable frame. Never fails. `who` non-NULL logs
+   the fallback; NULL is silent. */
+void al_image_xform_or_pixdim(const nifti_image *nim, mat44 *out, const char *who);
+
 /* Register source image to base image grid using affine (12 DOF) alignment.
    source: the moving image (will be modified in-place: data replaced, dims updated)
    base: the stationary/reference image
@@ -193,6 +368,15 @@ int al_image_xform(const nifti_image *nim, mat44 *out);
    final_interp default: cubic.
    Returns 0 on success, nonzero on error. */
 int nii_allineate(nifti_image *source, nifti_image *base, al_opts opts);
+
+/* Estimate-only registration: fit `source` to `base` and write the world-mm
+   FIXED(base)->MOVING(source) "pull" affine into *fixed_to_moving WITHOUT reslicing or
+   mutating either image (the caller applies it, e.g. via nii_apply_affine). This is the
+   estimate/apply seam: -master estimates once here then applies once onto its output
+   grid (no reslice-then-discard), and -savemat can serialize the matrix directly.
+   Returns 0 on success, nonzero on error. Serial-only. */
+int nii_allineate_estimate(nifti_image *source, nifti_image *base, al_opts opts,
+                           mat44 *fixed_to_moving);
 
 /* Copy the most recent nii_allineate() fit's world-space FIXED(base)->MOVING(source)
    affine (mm) into *out. Returns 0 if a fit has run, nonzero otherwise. The matrix
