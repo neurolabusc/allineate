@@ -119,7 +119,7 @@ def _run_allineate(flag):
 
 
 def _run_afni(mov, fix, out, threads, allineate, timeout):
-    # AFNI defaults: no -cost/-warp overrides. -prefix must not pre-exist unless we allow overwrite.
+    """AFNI 3dAllineate (reference tool, defaults)."""
     env = dict(os.environ, AFNI_DECONFLICT="OVERWRITE", OMP_NUM_THREADS=str(threads))
     if os.path.exists(out):
         os.remove(out)
@@ -170,9 +170,12 @@ def main():
                     help="path to the allineate binary (default: repo root)")
     ap.add_argument("--afni", action="store_true",
                     help="also benchmark AFNI 3dAllineate (must be on PATH)")
-    ap.add_argument("--engine", choices=("both", "allineate", "fast", "fast-robust"),
+    ap.add_argument("--engine",
+                    choices=("both", "allineate", "fast", "fast-robust", "afni"),
                     default="both",
-                    help="project engine(s) to benchmark (default: both)")
+                    help="engine(s) to benchmark (default: both = allineate+fast). 'fast-robust' adds "
+                         "-robustfov -com to the fast engine; 'afni' selects AFNI 3dAllineate "
+                         "standalone (or add it with --afni)")
     ap.add_argument("--timeout", type=int, default=3600,
                     help="per-registration timeout in seconds (default: 3600)")
     args = ap.parse_args()
@@ -181,10 +184,10 @@ def main():
         sys.exit(f"allineate binary not found/executable at '{args.allineate}' — run `make` in {REPO}")
 
     engines = (["allineate", "fast"] if args.engine == "both" else [args.engine])
-    if args.afni:
-        if shutil.which("3dAllineate") is None:
-            sys.exit("--afni given but 3dAllineate is not on PATH")
+    if args.afni and "afni" not in engines:
         engines.append("afni")
+    if "afni" in engines and shutil.which("3dAllineate") is None:
+        sys.exit("an AFNI engine was requested but 3dAllineate is not on PATH")
 
     inputs_dir = os.path.join(HERE, "inputs")
     templates_dir = os.path.join(HERE, "templates")

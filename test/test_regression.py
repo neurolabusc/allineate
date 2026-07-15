@@ -328,6 +328,52 @@ def main():
         rc, _ = run(exe, [j("cf_4d.nii.gz"), j("cf_fix.nii.gz"), "-cost", "fastcr", j("cf_4d_out.nii.gz")])
         check("coreg fast rejects 4D moving (nonzero exit)", rc != 0, f"rc={rc}")
 
+        # 7c. `-cost` is symmetric last-one-wins: the FINAL selector decides the engine regardless
+        # of order (a later `fast` must clear an earlier ordinary `-cost`, and vice-versa).
+        rc_hf, _ = run(exe, [j("cf_mov_rigid.nii.gz"), j("cf_fix.nii.gz"),
+                             "-cost", "hel", "-cost", "fast", j("cf_hf.nii.gz")])
+        rc_fh, _ = run(exe, [j("cf_mov_rigid.nii.gz"), j("cf_fix.nii.gz"),
+                             "-cost", "fast", "-cost", "hel", j("cf_fh.nii.gz")])
+        check("-cost last-one-wins: '-cost hel -cost fast' and reverse both accepted",
+              rc_hf == 0 and rc_fh == 0, f"hel->fast rc={rc_hf}, fast->hel rc={rc_fh}")
+
+        # 7d. -fill controls the out-of-FOV OUTPUT fill. A cropped moving (x<22) covers only half the
+        # fixed grid, so the x>=22 output voxels are out-of-FOV: `nan` fills them NaN, `zero` fills 0
+        # — voxels NaN under -fill nan must be exactly 0 under -fill zero (a visible, mode-controlled
+        # output contract that also exercises the fast-path reslice fill).
+        mov_crop = np.ascontiguousarray(phan[:, :, :22])   # drop the x>=22 half
+        save(mov_crop, Sf, j("cf_mov_crop.nii.gz"))        # same Sf -> shares fixed voxels x<22
+        for fm in ("nan", "zero", "auto"):
+            run(exe, [j("cf_mov_crop.nii.gz"), j("cf_fix.nii.gz"), "-cost", "fast",
+                      "-fill", fm, j(f"cf_fill_{fm}.nii.gz")])
+        dn = np.asarray(nib.load(j("cf_fill_nan.nii.gz")).dataobj, float)
+        dz = np.asarray(nib.load(j("cf_fill_zero.nii.gz")).dataobj, float)
+        oob = np.isnan(dn)
+        check("-fill nan fills out-of-FOV with NaN (some OOB voxels exist)", bool(oob.any()),
+              "no NaN in -fill nan output; fixture has no out-of-FOV voxels")
+        check("-fill zero fills the same out-of-FOV voxels with 0",
+              bool(oob.any()) and np.all(dz[oob] == 0.0),
+              "-fill zero did not zero the voxels -fill nan marked NaN")
+        # ORDINARY engine (-cost hel) uses a SEPARATE fused-warp/post-fill path (al_fill_fused_oob),
+        # not the fast reslice above, so gate it independently — and assert `auto` (a NEGATIVE-min
+        # source, so auto resolves to the source minimum, not 0). Cropped moving -> half OOB.
+        mov_cropneg = np.ascontiguousarray(phan[:, :, :22]).astype(np.float32) - 50.0   # min ~ -50
+        save(mov_cropneg, Sf, j("cf_mov_cropneg.nii.gz"))
+        src_min = float(np.asarray(nib.load(j("cf_mov_cropneg.nii.gz")).dataobj, float).min())
+        for fm in ("nan", "auto", "zero"):
+            run(exe, [j("cf_mov_cropneg.nii.gz"), j("cf_fix.nii.gz"), "-cost", "hel",
+                      "-fill", fm, j(f"cf_ofill_{fm}.nii.gz")])
+        odn = np.asarray(nib.load(j("cf_ofill_nan.nii.gz")).dataobj, float)
+        oda = np.asarray(nib.load(j("cf_ofill_auto.nii.gz")).dataobj, float)
+        odz = np.asarray(nib.load(j("cf_ofill_zero.nii.gz")).dataobj, float)
+        oob2 = np.isnan(odn)
+        check("-fill (ordinary -cost hel) auto == source minimum out of FOV (negative source)",
+              bool(oob2.any()) and np.allclose(oda[oob2], src_min, atol=1e-3),
+              f"ordinary auto OOB fill != source min {src_min:.3f}")
+        check("-fill (ordinary -cost hel) zero fills OOB with 0",
+              bool(oob2.any()) and np.all(odz[oob2] == 0.0),
+              "ordinary -fill zero did not zero the OOB voxels")
+
         # no-overlap must FAIL (nonzero exit), not silently save an identity matrix.
         Sfar = Sf.copy(); Sfar[:3, 3] += 500.0     # move the head 500 mm away -> no overlap
         img = nib.Nifti1Image(phan, Sfar)

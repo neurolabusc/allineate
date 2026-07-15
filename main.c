@@ -71,10 +71,15 @@ int show_help( void ) {
 	printf("                               -interp does NOT affect the output image (use -final).\n");
 	printf("                       -final XX  (NN,linear,cubic) output interpolation [default: cubic]\n");
 	printf("                       -nearest -linear -cubic (shortcuts for -final)\n");
+	printf("                       -fill XX  (auto,zero,nan) out-of-FOV output fill [default: auto =\n");
+	printf("                                 0, or the darkest voxel if it is <0 (CT/HU air)]\n");
 	printf("                       -warp XX (sho,shr,srs,aff) transform type [default: aff]\n");
 	printf("                         sho=shift(3), shr=shift+rotate(6), srs=+scale(9), aff=+shear(12)\n");
 	printf("                       -skullstrip XX  brain mask in moving space; output = stationary\n");
 	printf("                                 with non-brain voxels set to darkest value [default final: linear]\n");
+	printf("                       -weight XX  stationary-space weight image (dims match stationary):\n");
+	printf("                                 steers the fast-engine FINE stage to a region (e.g. brain).\n");
+	printf("                                 Fast engine only (-cost fast/fastcr).\n");
 	printf("                       -robustfov [mm] crop the moving image to a robust FOV (default 170mm),\n");
 	printf("                                 removing lower head/neck (emulates FSL robustfov); adjusts\n");
 	printf("                                 dim and valid sform/qform. A good pre-step before registration.\n");
@@ -142,6 +147,13 @@ static int resolve_output_interp(const al_opts *o) {
 	return (o->final_interp == AL_INTERP_DEFAULT) ? AL_INTERP_CUBIC : o->final_interp;
 }
 
+/* Out-of-FOV output fill for the apply-affine CLI paths (the normal-registration path
+   honors opts.fillmode inside nii_allineate). al_image_fillv extracts float internally so
+   AUTO sees negative Hounsfield air even when the moving image is a raw int16 CT. */
+static float resolve_output_fill(const al_opts *o, nifti_image *moving) {
+	return al_image_fillv(o->fillmode, moving);
+}
+
 /* Finalize output: for stdout, force single-file NIfTI-1 and set names to "-";
    otherwise set the output filename. Then write. Returns 0 on success. */
 static int write_result(nifti_image *out, const char *output_name, int isStdOut) {
@@ -195,7 +207,8 @@ static void json_mat44(FILE *f, mat44 m, const char *key) {
    Returns 0 on success. */
 static int write_affine_json(const char *path, mat44 fwd, const char *engine,
                              int dof, const char *cost_name,
-                             const char *fixed_name, const char *moving_name) {
+                             const char *fixed_name, const char *moving_name,
+                             const char *weight_name) {
 	FILE *f = fopen(path, "w");
 	if (!f) { fprintf(stderr, "Failed to open '%s' for -savemat\n", path); return 1; }
 	mat44 inv = nifti_mat44_inverse(fwd);
@@ -209,6 +222,9 @@ static int write_affine_json(const char *path, mat44 fwd, const char *engine,
 	fprintf(f, "  \"cost\": "); json_str(f, cost_name); fprintf(f, ",\n");
 	fprintf(f, "  \"fixed\": "); json_str(f, fixed_name ? fixed_name : ""); fprintf(f, ",\n");
 	fprintf(f, "  \"moving\": "); json_str(f, moving_name ? moving_name : ""); fprintf(f, ",\n");
+	/* Record the fine-stage region weight so two materially different fits (whole-head vs
+	   ROI-weighted) have distinguishable provenance. Omitted entirely when unweighted. */
+	if (weight_name) { fprintf(f, "  \"weight\": "); json_str(f, weight_name); fprintf(f, ",\n"); }
 	fprintf(f, "  \"comment\": \"fixed_to_moving maps FIXED (stationary) world-mm to MOVING "
 	           "(source) world-mm: the pull/resampling transform (for each fixed-grid voxel, "
 	           "transform to moving world to sample). moving_to_fixed is its inverse. If "
@@ -217,7 +233,11 @@ static int write_affine_json(const char *path, mat44 fwd, const char *engine,
 	json_mat44(f, fwd, "fixed_to_moving"); fprintf(f, ",\n");
 	json_mat44(f, inv, "moving_to_fixed"); fprintf(f, "\n");
 	fprintf(f, "}\n");
-	if (ferror(f) | fclose(f)) {
+	/* Read the stream error state BEFORE closing: `ferror(f) | fclose(f)` is unsequenced, so
+	   fclose() could run first and ferror() would then inspect a closed stream (UB). */
+	int werr = ferror(f);
+	int cerr = fclose(f);
+	if (werr || cerr) {
 		fprintf(stderr, "Failed to write '%s' for -savemat\n", path);
 		return 1;
 	}
@@ -457,6 +477,19 @@ int main(int argc, char * argv[]) {
 			return 1;
 		}
 	}
+	/* -weight (region-focused fine-stage fit) is currently implemented only for the fast
+	   engine. Reject it for the ordinary engine / -applymat / -skullstrip / preprocessing-only
+	   rather than silently ignoring it. */
+	if (opts.weight && !opts.fast) {
+		fprintf(stderr, "-weight is only supported with the fast engine (-cost fast/-cost fastcr)\n");
+		return 1;
+	}
+	/* Reject stdin for -weight: only the moving image may be piped, and its cached buffer
+	   would otherwise be re-read and mistaken for a plausible weight when dims match. */
+	if (opts.weight && !strcmp(opts.weight, "-")) {
+		fprintf(stderr, "-weight does not support stdin ('-'); give a weight-image file\n");
+		return 1;
+	}
 	/* -applymat is a standalone apply mode: reslice the moving image onto the
 	   stationary (target) grid using a saved world-space matrix; it does NO
 	   registration, so it is exclusive with the registration/preprocessing modes. */
@@ -603,7 +636,7 @@ int main(int argc, char * argv[]) {
 			nifti_image_free(moving); nifti_image_free(stationary); goto cleanup;
 		}
 		int interp = resolve_output_interp(&opts);
-		if (nii_apply_affine(moving, stationary, ftm, interp, 0.0f)) {
+		if (nii_apply_affine(moving, stationary, ftm, interp, resolve_output_fill(&opts, moving))) {
 			fprintf(stderr, "-applymat failed on '%s'\n", moving_name);
 			nifti_image_free(moving); nifti_image_free(stationary); goto cleanup;
 		}
@@ -671,13 +704,32 @@ int main(int argc, char * argv[]) {
 		/* -com and -nocmass are strict overrides; otherwise auto-select initialization. */
 		cfo.use_cmass = !opts.com &&
 		                 !((opts.cli_set & AL_CLI_CMASS) && opts.cmass == AL_CMASS_NONE);
+		/* -weight: a stationary-space region weight for the fine stage. Loaded here and freed
+		   immediately after the estimate (coreg_fast_estimate only reads it during the call).
+		   The CLI only owns what it must (read + stdin already rejected at parse); the estimator
+		   boundary owns weight validation (dims + world frame + LS/3D) and its diagnostics. */
+		nifti_image *weight_img = NULL;
+		if (opts.weight) {
+			weight_img = nifti_image_read(opts.weight, 1);
+			if (!weight_img) {
+				fprintf(stderr, "Failed to read -weight image '%s'\n", opts.weight);
+				nifti_image_free(moving); nifti_image_free(stationary);
+				goto cleanup;
+			}
+			cfo.weight = weight_img;
+			fprintf(stderr, " + Fine-stage region weighting from '%s'\n", opts.weight);
+		}
 		coreg_fast_result res;
-		if (coreg_fast_estimate(moving, stationary, &cfo, &res)) {
-			if (fast_default) {
+		int est_rc = coreg_fast_estimate(moving, stationary, &cfo, &res);
+		nifti_image_free(weight_img); weight_img = NULL;
+		if (est_rc) {
+			if (fast_default && !opts.weight) {
 				/* The default fast engine could not register this image (too small/degenerate for
 				   its pyramid). Fall back to the robust Hellinger engine below so a bare
 				   registration never regresses; an explicit -cost fast/fastcr still errors.
-				   moving/stationary are intact (the failed estimate does not mutate them). */
+				   moving/stationary are intact (the failed estimate does not mutate them).
+				   NOT when -weight was requested: the ordinary engine ignores it, so silently
+				   dropping to an unweighted fit would defeat the explicit region request. */
 				fprintf(stderr, " + Fast registration failed; falling back to -cost hel\n");
 				opts.fast = 0;
 				opts.cost = AL_COST_HELLINGER;
@@ -708,7 +760,7 @@ int main(int argc, char * argv[]) {
 				}
 				grid = master;
 			}
-			int arc = nii_apply_affine(moving, grid, res.fixed_to_moving, interp, 0.0f);
+			int arc = nii_apply_affine(moving, grid, res.fixed_to_moving, interp, resolve_output_fill(&opts, moving));
 			if (master) nifti_image_free(master);
 			if (arc) {
 				fprintf(stderr, "Fast registration final reslice failed\n");
@@ -725,7 +777,7 @@ int main(int argc, char * argv[]) {
 		                        (res.resolved_cost == CF_COST_HEL) ? "hel" : "cr";
 		if (opts.savemat &&
 		    write_affine_json(opts.savemat, res.fixed_to_moving, "coreg_fast", res.resolved_dof,
-		                      fast_cost, stationary_name, moving_name)) {
+		                      fast_cost, stationary_name, moving_name, opts.weight)) {
 			fprintf(stderr, "Failed to save affine to '%s'\n", opts.savemat);
 			nifti_image_free(moving); goto cleanup;
 		}
@@ -767,7 +819,7 @@ int main(int argc, char * argv[]) {
 			int interp = resolve_output_interp(&opts);
 			nifti_image *grid = nifti_image_read(opts.master, 1);
 			if (!grid || nii_last_affine(&aff) ||
-			    nii_apply_affine(master_out, grid, aff, interp, 0.0f)) {
+			    nii_apply_affine(master_out, grid, aff, interp, resolve_output_fill(&opts, master_out))) {
 				fprintf(stderr, "-master reslice onto '%s' failed\n", opts.master);
 				if (grid) nifti_image_free(grid);
 				nifti_image_free(master_out); nifti_image_free(moving);
@@ -788,7 +840,7 @@ int main(int argc, char * argv[]) {
 			mat44 aff;
 			if (nii_last_affine(&aff) ||
 			    write_affine_json(opts.savemat, aff, "allineate", opts.warp,
-			                      al_cost_name(opts.cost), stationary_name, moving_name)) {
+			                      al_cost_name(opts.cost), stationary_name, moving_name, NULL)) {
 				fprintf(stderr, "Failed to save affine to '%s'\n", opts.savemat);
 				nifti_image_free(moving);
 				goto cleanup;
