@@ -656,7 +656,8 @@ static int cf_make_samples(cf_ctx *c, int K) {
        (`wmax==0` in the driver skips the remap, so `fwt_max==0`). The per-pose weighted-coverage
        floor (N >= 10% of fwt_total) is retained for the accepted case. */
     if (c->fwt && !(fwt_max > CF_WEIGHT_FLOOR + 1e-3)) {
-        fprintf(stderr, "coreg fast: -weight has no positive weight over the fixed foreground\n");
+        fprintf(stderr, "coreg fast: -weight ROI does not reach the fixed foreground "
+                        "(no pyramid-sampled weight rises above the background floor)\n");
         return 1;
     }
     c->ns = ns; c->K = K;
@@ -865,7 +866,10 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
             size_t wnv = (size_t)fnx * fny * fnz;
             float wmax = 0.0f;
             for (size_t i = 0; i < wnv; i++) {
-                if (!(wfull[i] > 0.0f)) wfull[i] = 0.0f;
+                /* Clamp negatives/NaN AND +Inf to 0 (magnitude guard, since this TU is
+                   -ffast-math and a +Inf would poison the remap: wmax=+Inf -> inv=0 ->
+                   Inf*0=NaN for that voxel and every finite ROI value collapses to the floor). */
+                if (!(wfull[i] > 0.0f && wfull[i] <= FLT_MAX)) wfull[i] = 0.0f;
                 else if (wfull[i] > wmax) wmax = wfull[i];
             }
             /* AFNI-style whole-head anchor (the wisdom of 3dAllineate's -autobox default): do NOT
@@ -882,9 +886,12 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
                special-casing is needed. Only fixed-FOREGROUND voxels are ever sampled, so the floor
                on true background (air) is inert. */
             if (wmax > 0.0f) {
-                float inv = 1.0f / wmax;
+                /* Divide directly rather than multiply by 1/wmax: a subnormal/tiny wmax makes
+                   1.0f/wmax overflow to +Inf, and then 0*Inf=NaN (background) / tiny*Inf=+Inf
+                   (foreground) would poison the remap (+Inf is not caught downstream). Because
+                   every wfull[i] <= wmax, the ratio is in [0,1] and CANNOT overflow. */
                 for (size_t i = 0; i < wnv; i++)
-                    wfull[i] = CF_WEIGHT_FLOOR + (1.0f - CF_WEIGHT_FLOOR) * (wfull[i] * inv);
+                    wfull[i] = CF_WEIGHT_FLOOR + (1.0f - CF_WEIGHT_FLOOR) * (wfull[i] / wmax);
             }
             if (cf_build_level(wfull, fnx,fny,fnz, &Sf, SEP[2], FWHM[2], &Lwt[2])) build_ok = 0;
             free(wfull);

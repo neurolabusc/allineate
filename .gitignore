@@ -12,6 +12,7 @@ allineate.baseline
 
 # Large local scratch data (not test fixtures — use `git add -f` to track intentionally)
 /MNI152_T1_0.5mm.nii.gz
+/qwarp/
 audit*.md
 
 # macOS
