@@ -18,7 +18,7 @@
 # the optimization penalty at build time is negligible next to the run time.
 
 CNAME ?= clang
-SRC    = main.c allineate.c nifti_io.c powell_newuoa.c miniCoreFLT.c coreg_fast.c
+SRC    = main.c allineate.c nifti_io.c powell_newuoa.c miniCoreFLT.c coreg_fast.c qwarp.c
 OUT    = allineate
 
 # zlib is required; zstd is optional and experimental (ZSTD=1).
@@ -72,12 +72,18 @@ all:
 # with NULL opts (the default-options contract) — a path the CLI never takes. Built here so
 # `make test` also gates it; test_regression.py (§13) generates fixtures and runs it.
 CAPI_OUT = test_capi_nullopts
+QWCAPI_OUT = test_qwarp_capi
 test: all
 	$(CNAME) $(CFLAGS) $(OMPFLAGS) $(ZFLAGS) -I. test/test_capi_nullopts.c \
 		allineate.c nifti_io.c powell_newuoa.c miniCoreFLT.c coreg_fast.c \
 		$(ZLIB) $(OMPLINK) -lm -o $(CAPI_OUT)
+	$(CNAME) $(CFLAGS) $(OMPFLAGS) $(ZFLAGS) -I. test/test_qwarp_capi.c \
+		allineate.c nifti_io.c powell_newuoa.c miniCoreFLT.c coreg_fast.c qwarp.c \
+		$(ZLIB) $(OMPLINK) -lm -o $(QWCAPI_OUT)
 	python3 test/test_regression.py --allineate ./$(OUT)
 	python3 test/test_coreg_fast.py
+	python3 test/test_qwarp.py --allineate ./$(OUT)
+	./$(QWCAPI_OUT)
 
 # Optional shared-source parity check — NOT part of `make test`, so a clean clone with no
 # niimath checkout still builds and gates. Confirms the eight drop-in files are byte-for-byte
@@ -121,4 +127,4 @@ profile: $(SRC)
 	$(CNAME) $(CFLAGS) $(OMPFLAGS) $(ZFLAGS) -DAL_PROFILE $(SRC) $(ZLIB) $(OMPLINK) -lm -o $(OUT)
 
 clean:
-	rm -f $(OUT) allineate.baseline test_capi_nullopts *.o
+	rm -f $(OUT) allineate.baseline test_capi_nullopts test_qwarp_capi *.o

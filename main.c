@@ -11,6 +11,7 @@
 #include "allineate.h"
 #include "miniCoreFLT.h"
 #include "coreg_fast.h"
+#include "qwarp.h"
 #if defined(_OPENMP)
 	#include <omp.h>
 #endif
@@ -92,6 +93,10 @@ int show_help( void ) {
 	printf("                       -master grid.nii  register at the stationary resolution, but reslice the\n");
 	printf("                                 output onto THIS grid (e.g. a higher-res template sharing the\n");
 	printf("                                 stationary world frame). Works with both engines. -final sets interp.\n");
+	printf("                       -qwarp  NONLINEAR (deformable) registration; EXCLUSIVE mode. Only form:\n");
+	printf("                                 allineate <moving> <stationary> -qwarp <output>. Inputs must already\n");
+	printf("                                 be affine-aligned + skull-stripped + share the stationary grid.\n");
+	printf("                                 Port of AFNI 3dQwarp -blur 0 3. No other option is accepted with it.\n");
 	printf("                       -com  set the origin to the brightness center of mass (header-only\n");
 	printf("                                 translation of the affine); a cheap centered start for\n");
 	printf("                                 symmetric images. Runs after -robustfov, before -sym.\n");
@@ -348,11 +353,52 @@ static int cli_parse_subopts(int *ac, int argc, char **argv, al_opts *opts,
 	return 0;
 }
 
+/* Exclusive -qwarp mode: `allineate <moving> <stationary> -qwarp <output>` — a faithful
+   minimal port of `3dQwarp -blur 0 3 -source <moving> -base <stationary> -prefix <output>`
+   (nonlinear stage only). No other option, extra operand, or stdin/stdout ('-') form is
+   accepted, and the grammar is validated BEFORE any large image is read. Kept entirely in
+   main.c (no al_opts field) per the qwarp goal; the engine lives in qwarp.c. */
+static int run_qwarp(int argc, char *argv[]) {
+	/* Enforce the EXACT positional grammar — argv = { prog, <moving>, <stationary>, -qwarp,
+	   <output> } — not just "-qwarp appears somewhere". This rejects reordered forms such as
+	   `moving stationary output -qwarp` or `moving -qwarp stationary output` that a
+	   position-agnostic parse would silently accept, matching the documented single form. */
+	if (argc != 5 || strcmp(argv[3], "-qwarp") != 0) {
+		fprintf(stderr, "-qwarp is an exclusive mode; the only accepted form is:\n"
+		                "  allineate <moving> <stationary> -qwarp <output>\n");
+		return 1;
+	}
+	const char *moving_name = argv[1], *stationary_name = argv[2], *output_name = argv[4];
+	/* the three operand slots must be real names, not a stray flag or a stdin/stdout '-' */
+	if (moving_name[0] == '-' || stationary_name[0] == '-' || output_name[0] == '-') {
+		fprintf(stderr, "-qwarp operands must be filenames (no options or stdin/stdout '-')\n");
+		return 1;
+	}
+
+	nifti_image *moving = nifti_image_read(moving_name, 1);
+	if (!moving) { fprintf(stderr, "Failed to read moving image '%s'\n", moving_name); return 1; }
+	nifti_image *stationary = nifti_image_read(stationary_name, 1);
+	if (!stationary) {
+		fprintf(stderr, "Failed to read stationary image '%s'\n", stationary_name);
+		nifti_image_free(moving); return 1;
+	}
+	nifti_image *out = NULL;
+	int rc = qwarp_run(moving, stationary, &out);   /* atomic: out set only on full success */
+	nifti_image_free(moving); nifti_image_free(stationary);
+	if (rc || !out) return 1;                        /* reason already printed; no output written */
+	rc = write_result(out, output_name, 0);
+	nifti_image_free(out);
+	return rc ? 1 : 0;
+}
+
 int main(int argc, char * argv[]) {
 	if (argc < 4) {
 		show_help();
 		return (argc > 1) ? 1 : 0;
 	}
+	/* Exclusive -qwarp mode is handled entirely before the normal registration parsing. */
+	for (int i = 1; i < argc; i++)
+		if (!strcmp(argv[i], "-qwarp")) return run_qwarp(argc, argv);
 #ifdef _WIN32
 	/* Set binary mode for stdin/stdout when piping NIfTI data */
 	_setmode(_fileno(stdin), _O_BINARY);

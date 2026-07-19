@@ -2,6 +2,7 @@
 allineate
 allineate.baseline
 /test_capi_nullopts
+/test_qwarp_capi
 
 # Object files
 *.o
