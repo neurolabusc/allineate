@@ -18,7 +18,7 @@
 # the optimization penalty at build time is negligible next to the run time.
 
 CNAME ?= clang
-SRC    = main.c allineate.c nifti_io.c powell_newuoa.c miniCoreFLT.c coreg_fast.c qwarp.c
+SRC    = main.c allineate.c nifti_io.c powell_newuoa.c miniCoreFLT.c coreg_fast.c qwarp.c reface.c
 OUT    = allineate
 
 # zlib is required; zstd is optional and experimental (ZSTD=1).
@@ -86,19 +86,43 @@ test: all
 	./$(QWCAPI_OUT)
 
 # Optional shared-source parity check — NOT part of `make test`, so a clean clone with no
-# niimath checkout still builds and gates. Confirms the eight drop-in files are byte-for-byte
+# niimath checkout still builds and gates. Confirms the drop-in files are byte-for-byte
 # identical to their niimath source of truth (silent drift here has twice shipped a stale
 # nifti_io.c past a green `make test`). Supply the checkout path; exits nonzero listing any
 # drifted file so a release/CI step can gate on it separately from the correctness gate:
 #     make parity NIIMATH=/path/to/niimath
-SHARED = allineate.c allineate.h coreg_fast.c coreg_fast.h powell_newuoa.c nifti_io.c nifti_io.h core32.h
+#
+# LEADING-EDGE EXPECTATION (2026-07): `allineate.c/.h` and `coreg_fast.c/.h` currently DRIFT
+# by design — the fast-engine leading-edge features (HEL joint-foreground moving-dark skip,
+# weight-at-finest-level, `-weight`) diverge them ahead of niimath (see AGENTS.md "LEADING-EDGE
+# DIVERGENCE"). `qwarp.c/.h` and `reface.c/.h` are standalone leading-edge files not yet in
+# niimath and are intentionally NOT listed in SHARED. So `make parity` is EXPECTED to report
+# those drifts until the features are back-ported; it is a resync aid, not a hard release
+# blocker while divergence is active. The
+# always-required release gate is `make test`. `nifti_io.c/.h`, `powell_newuoa.c`, `core32.h`
+# must stay byte-identical (they are external drop-ins) — an unexpected drift THERE is the real
+# signal this check exists to catch.
+# SHARED_STABLE — external drop-ins that MUST stay byte-identical; drift here is the real
+#   defect this check exists to catch, and fails the target (nonzero exit).
+# SHARED_LEADING — files intentionally diverged ahead of niimath by active leading-edge
+#   fast-engine features (HEL joint-foreground skip, weight-at-finest-level). Drift is EXPECTED and only reported (does
+#   NOT fail), so the target can machine-distinguish it from accidental drift. When these are
+#   back-ported, move them into SHARED_STABLE and restore byte-equality.
+SHARED_STABLE  = powell_newuoa.c nifti_io.c nifti_io.h core32.h
+SHARED_LEADING = allineate.c allineate.h coreg_fast.c coreg_fast.h
 parity:
 	@test -n "$(NIIMATH)" || { echo "set NIIMATH=/path/to/niimath (its src/ holds the source of truth)"; exit 2; }
-	@rc=0; for f in $(SHARED); do \
+	@rc=0; \
+	for f in $(SHARED_STABLE); do \
 		if cmp -s "$$f" "$(NIIMATH)/src/$$f"; then echo "  ok    $$f"; \
-		else echo "  DRIFT $$f"; rc=1; fi; \
+		else echo "  DRIFT $$f  (external drop-in — MUST match)"; rc=1; fi; \
 	done; \
-	if [ $$rc -ne 0 ]; then echo "** parity FAILED — resync drifted files from $(NIIMATH)/src"; fi; \
+	for f in $(SHARED_LEADING); do \
+		if cmp -s "$$f" "$(NIIMATH)/src/$$f"; then echo "  ok    $$f"; \
+		else echo "  drift $$f  (expected: leading-edge, awaiting back-port)"; fi; \
+	done; \
+	if [ $$rc -ne 0 ]; then echo "** parity FAILED — an external drop-in drifted; resync from $(NIIMATH)/src"; \
+	else echo "++ parity OK — external drop-ins match (leading-edge drift, if any, is expected)"; fi; \
 	exit $$rc
 
 # AddressSanitizer build for heap-overflow / use-after-free testing.

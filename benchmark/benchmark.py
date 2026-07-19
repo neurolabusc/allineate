@@ -110,21 +110,25 @@ def run_timed(cmd, env, timeout):
 # Engine registry: name -> callable(moving, stationary, out, threads, allineate, timeout) that
 # runs one registration under /usr/bin/time and returns (secs, peak_mb) or None.
 def _run_allineate(flag):
-    def run(mov, fix, out, threads, allineate, timeout):
+    def run(mov, fix, out, threads, allineate, timeout, weight=None):
         if os.path.exists(out):
             os.remove(out)
         cmd = (["/usr/bin/time", TIME_FLAG, allineate, mov, fix, out, "-p", str(threads)] + flag)
+        if weight:
+            cmd += ["-weight", weight]
         return run_timed(cmd, os.environ.copy(), timeout)
     return run
 
 
-def _run_afni(mov, fix, out, threads, allineate, timeout):
+def _run_afni(mov, fix, out, threads, allineate, timeout, weight=None):
     """AFNI 3dAllineate (reference tool, defaults)."""
     env = dict(os.environ, AFNI_DECONFLICT="OVERWRITE", OMP_NUM_THREADS=str(threads))
     if os.path.exists(out):
         os.remove(out)
     cmd = ["/usr/bin/time", TIME_FLAG, "3dAllineate",
            "-base", fix, "-source", mov, "-prefix", out]
+    if weight:
+        cmd += ["-weight", weight]
     return run_timed(cmd, env, timeout)
 
 
@@ -178,7 +182,19 @@ def main():
                          "standalone (or add it with --afni)")
     ap.add_argument("--timeout", type=int, default=3600,
                     help="per-registration timeout in seconds (default: 3600)")
+    ap.add_argument("--weight", metavar="WEIGHTIMG",
+                    help="weighted-registration mode: pass `-weight WEIGHTIMG` to every engine "
+                         "(AFNI 3dAllineate-style graded weight), register only to --base, and score "
+                         "the masked cost inside the weight's brain plateau. Requires --base.")
+    ap.add_argument("--base", metavar="BASEIMG",
+                    help="single stationary/base image for --weight mode (e.g. the SSW1 template). "
+                         "The WEIGHTIMG must already share this base's grid.")
+    ap.add_argument("--mask", metavar="MASKIMG",
+                    help="override the masked-cost ROI (default in --weight mode: WEIGHTIMG > 0.3*max).")
     args = ap.parse_args()
+
+    if args.weight and not args.base:
+        sys.exit("--weight requires --base (the single stationary the weight is defined on)")
 
     if not os.access(args.allineate, os.X_OK):
         sys.exit(f"allineate binary not found/executable at '{args.allineate}' — run `make` in {REPO}")
@@ -199,24 +215,60 @@ def main():
                      if f.endswith((".nii", ".nii.gz")))
     stationaries = sorted(os.path.join(templates_dir, f) for f in os.listdir(templates_dir)
                           if f.endswith((".nii", ".nii.gz")))
-    if not movings or not stationaries:
-        sys.exit("no inputs/ or templates/ images found")
+
+    def plateau_mask(weight_path, tag):
+        """Brain ROI = the graded weight's high plateau (> 0.3*max): the brain/deep-tissue
+        core, so the masked cost excludes the attenuated scalp/background."""
+        w = nib.load(weight_path).get_fdata(dtype=np.float32)
+        mp = os.path.join(out_dir, f"_plateau_{tag}.nii.gz")
+        nib.save(nib.Nifti1Image((w > 0.3 * float(w.max())).astype(np.uint8),
+                                 nib.load(weight_path).affine), mp)
+        return mp
+
+    # A "case" is (stationary_path, weight_path_or_None, mask_path, label). The benchmark scores
+    # each moving against every case; a weighted case additionally passes `-weight` to every engine
+    # and scores the masked cost inside the weight plateau.
+    cases = []
+    if args.weight:
+        # Explicit single-base weighted mode (--weight/--base): unchanged behavior.
+        wm = args.mask if args.mask else plateau_mask(args.weight, stem(args.base))
+        cases.append((args.base, args.weight, wm, stem(args.base) + " +w"))
+    else:
+        for st in stationaries:
+            cases.append((st, None, os.path.join(masks_dir, f"{stem(st)}_brain_mask.nii.gz"), stem(st)))
+        # Weighted templates are a DEFAULT part of the benchmark: weighted/<T>.nii.gz paired with
+        # weighted/<T>_weight.nii.gz. Each input is registered to <T> with `-weight <T>_weight`,
+        # and the masked cost is scored inside the weight plateau.
+        wdir = os.path.join(HERE, "weighted")
+        if os.path.isdir(wdir):
+            for wt in sorted(f for f in os.listdir(wdir) if f.endswith((".nii", ".nii.gz"))
+                             and not stem(f).endswith("_weight")):
+                wpath = os.path.join(wdir, wt)
+                weight = os.path.join(wdir, f"{stem(wt)}_weight.nii.gz")
+                if not os.path.exists(weight):
+                    sys.stderr.write(f"  (skip weighted template {stem(wt)}: no {stem(wt)}_weight image)\n")
+                    continue
+                cases.append((wpath, weight, plateau_mask(weight, stem(wt)), stem(wt) + " +w"))
+
+    if not movings or not cases:
+        sys.exit("no inputs/ or templates/ (or weighted/) images found")
 
     # engine -> list of table rows
     tables = {e: [] for e in engines}
     n_fail = 0
     for engine in engines:
         sys.stderr.write(f"\n=== engine: {engine} (1 and {N_THREADS} threads) ===\n")
-        for st in stationaries:
-            mask = os.path.join(masks_dir, f"{stem(st)}_brain_mask.nii.gz")
+        for st, wgt, mask, label in cases:
             for mv in movings:
-                out = os.path.join(out_dir, f"{stem(mv)}__to__{stem(st)}__{engine}.nii.gz")
-                row = [stem(st), stem(mv)]
+                wtag = "__weight" if wgt else ""
+                out = os.path.join(out_dir, f"{stem(mv)}__to__{stem(st)}__{engine}{wtag}.nii.gz")
+                row = [label, stem(mv)]
                 res = {}
                 for tag, threads in (("1", 1), ("n", N_THREADS)):
-                    sys.stderr.write(f"  {stem(mv):16s} -> {stem(st):16s} [{engine:9s} {tag:>2s}] ... ")
+                    sys.stderr.write(f"  {stem(mv):16s} -> {label:18s} [{engine:9s} {tag:>2s}] ... ")
                     sys.stderr.flush()
-                    r = ENGINES[engine](mv, st, out, threads, args.allineate, args.timeout)
+                    r = ENGINES[engine](mv, st, out, threads, args.allineate, args.timeout,
+                                        weight=wgt)
                     if r is None:
                         sys.stderr.write("FAIL/timeout\n")
                         n_fail += 1
@@ -242,10 +294,11 @@ def main():
           "(peak RSS); *Speed Up* = 1-thread Time / N-thread Time; *Cost* / *Cost Masked* = "
           "Hellinger-affinity match quality (higher = better; masked restricts to the template "
           f"brain mask). The `1` columns are single-thread, the `{N_THREADS}` columns use all cores.\n")
-    titles = {"allineate": "allineate ordinary engine (`-cost hel`)",
-              "fast": "fast (`-cost fast`, the default)",
-              "fast-robust": "fast robust (`-robustfov -com -cost fast`)",
-              "afni": "AFNI 3dAllineate (reference, defaults)"}
+    wsuf = " + `-weight`" if args.weight else ""
+    titles = {"allineate": "allineate ordinary engine (`-cost hel`)" + wsuf,
+              "fast": "fast (`-cost fast`, the default)" + wsuf,
+              "fast-robust": "fast robust (`-robustfov -com -cost fast`)" + wsuf,
+              "afni": "AFNI 3dAllineate (reference, defaults)" + wsuf}
     for engine in engines:
         print(f"### {titles[engine]}\n")
         print(markdown_table(tables[engine]) + "\n")

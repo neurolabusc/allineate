@@ -710,6 +710,181 @@ def main():
         else:
             print(f"  [SKIP] C-API harness not built ({capi}); run via `make test`")
 
+        # 14. -reface face-replacement. A structured phantom used as BOTH subject and template
+        #     makes the registration an (essentially) identity map, so a template-frame shell
+        #     back-projects onto the subject grid ~unchanged and the sign-based composite is
+        #     checkable at interior points. Uses -cost fastcr (the deterministic CR cost the
+        #     synthetic suites rely on; HEL is imprecise on smooth phantoms). Asserts geometry
+        #     preservation, region semantics, ifac brightness match, isola removal, p1==pN
+        #     bit-identity, and the CLI rejection matrix.
+        print("14. -reface face-replacement (semantics + geometry + isola + determinism)")
+        Nr = 48
+        Ar = np.diag([2.0, 2.0, 2.0, 1.0]); Ar[:3, 3] = -(Nr - 1) * 1.0
+        rzz, ryy, rxx = np.mgrid[0:Nr, 0:Nr, 0:Nr]
+        def _rg(cx, cy, cz, r, a):
+            return a * np.exp(-(((rxx-cx)**2 + (ryy-cy)**2 + (rzz-cz)**2) / (2.0 * r * r)))
+        brain = (_rg(24, 24, 24, 8, 300) + _rg(18, 28, 24, 5, 180) +
+                 _rg(30, 20, 26, 4, 150)).astype(np.float32)
+        save(brain, Ar, j("rf_subj.nii.gz"), dtype=np.int16)     # subject as int16 (like a real T1)
+        save(brain, Ar, j("rf_tmpl.nii.gz"), dtype=np.float32)   # identical template -> identity fit
+        subj_i16 = nib.load(j("rf_subj.nii.gz")).get_fdata()     # the quantized values the tool sees
+        shell = np.zeros((Nr, Nr, Nr), np.float32)
+        shell[16:32, 36:44, 16:32] = 200.0                       # +region: anterior "face" cube (insert)
+        shell[:, 45:47, :] = -1.0                                # outer shell (zero-out) slab
+        stray = (24, 10, 24)                                     # isolated + voxel -> isola must drop it
+        shell[stray] = 200.0
+        save(shell, Ar, j("rf_shell.nii.gz"), dtype=np.int16)
+        cube = (slice(16, 32), slice(36, 44), slice(16, 32))
+        # expected ifac brightness = mean(subject over shell>0 cube & subject!=0); the stray voxel
+        # is isola-removed before ifac, so it is excluded (matches the tool).
+        cmask = subj_i16[cube] != 0
+        ibar = float(subj_i16[cube][cmask].mean())
+
+        rc, err = run(exe, [j("rf_subj.nii.gz"), j("rf_tmpl.nii.gz"), "-cost", "fastcr",
+                            "-reface", j("rf_shell.nii.gz"), "-p", "1", j("rf_p1.nii.gz")])
+        check("reface runs (fastcr)", rc == 0, f"rc={rc}: {err.strip()[-160:]}")
+        if rc == 0:
+            out = nib.load(j("rf_p1.nii.gz"))
+            o = out.get_fdata()
+            subj = nib.load(j("rf_subj.nii.gz"))
+            check("reface output on subject grid (dims+affine)",
+                  o.shape == subj.shape and np.allclose(out.affine, subj.affine, atol=1e-4),
+                  f"shape={o.shape} vs {subj.shape}")
+            check("reface output is finite", bool(np.all(np.isfinite(o))))
+            check("reface output is float32", out.get_data_dtype() == np.float32)
+            # <0 shell region -> zeroed (interior of the slab)
+            check("reface: negative-shell region zeroed", abs(float(o[24, 46, 24])) < 1e-3,
+                  f"val={float(o[24,46,24]):.3f}")
+            # ==0 shell region with subject>0 -> preserved (brain center, no shell there)
+            sc = float(subj_i16[24, 24, 24])
+            check("reface: zero-shell region preserves subject",
+                  abs(float(o[24, 24, 24]) - sc) < 1e-3, f"out={float(o[24,24,24]):.2f} subj={sc:.2f}")
+            # +region interior (uniform cube -> blur-invariant) ~ shell*ifac = ibar
+            oc = float(o[24, 40, 24])
+            check("reface: positive-shell region ~ ifac-scaled (== ibar)",
+                  abs(oc - ibar) <= 0.15 * ibar + 1.0, f"out={oc:.2f} expected~ibar={ibar:.2f}")
+            check("reface: positive region actually replaced (differs from subject)",
+                  abs(oc - float(subj_i16[24, 40, 24])) > 1e-2)
+            # isola: the isolated + voxel is removed -> that site preserves subject, not inserted
+            ss = float(subj_i16[stray])
+            check("reface: isola drops isolated shell voxel (site preserves subject)",
+                  abs(float(o[stray]) - ss) < 1e-2, f"out={float(o[stray]):.2f} subj={ss:.2f}")
+
+        # p1 vs pN bit-identity of the whole reface op (registration + composite + blur)
+        rc4, _ = run(exe, [j("rf_subj.nii.gz"), j("rf_tmpl.nii.gz"), "-cost", "fastcr",
+                           "-reface", j("rf_shell.nii.gz"), "-p", "4", j("rf_p4.nii.gz")])
+        both = rc == 0 and rc4 == 0 and os.path.exists(j("rf_p4.nii.gz"))
+        check("reface p1 == p4 bit-identical", both and np.array_equal(
+              nib.load(j("rf_p1.nii.gz")).get_fdata(), nib.load(j("rf_p4.nii.gz")).get_fdata()))
+
+        # default fast engine (HEL) path also produces valid finite subject-grid output
+        rcd, errd = run(exe, [j("rf_subj.nii.gz"), j("rf_tmpl.nii.gz"),
+                              "-reface", j("rf_shell.nii.gz"), j("rf_def.nii.gz")])
+        okd = rcd == 0 and os.path.exists(j("rf_def.nii.gz"))
+        check("reface default (fast HEL) produces finite subject-grid output",
+              okd and np.all(np.isfinite(nib.load(j("rf_def.nii.gz")).get_fdata())) and
+              nib.load(j("rf_def.nii.gz")).shape == nib.load(j("rf_subj.nii.gz")).shape,
+              f"rc={rcd}: {errd.strip()[-140:]}")
+
+        # CLI rejection matrix (each must exit nonzero)
+        rej = [
+            ("no stationary",        [j("rf_subj.nii.gz"), "-reface", j("rf_shell.nii.gz"), j("o.nii.gz")]),
+            ("stdin shell",          [j("rf_subj.nii.gz"), j("rf_tmpl.nii.gz"), "-reface", "-", j("o.nii.gz")]),
+            ("-master",              [j("rf_subj.nii.gz"), j("rf_tmpl.nii.gz"), "-reface", j("rf_shell.nii.gz"), "-master", j("rf_tmpl.nii.gz"), j("o.nii.gz")]),
+            ("-savemat",             [j("rf_subj.nii.gz"), j("rf_tmpl.nii.gz"), "-reface", j("rf_shell.nii.gz"), "-savemat", j("o.json"), j("o.nii.gz")]),
+            ("-skullstrip",          [j("rf_subj.nii.gz"), j("rf_tmpl.nii.gz"), "-reface", j("rf_shell.nii.gz"), "-skullstrip", j("rf_shell.nii.gz"), j("o.nii.gz")]),
+            ("-com",                 [j("rf_subj.nii.gz"), j("rf_tmpl.nii.gz"), "-reface", j("rf_shell.nii.gz"), "-com", j("o.nii.gz")]),
+            ("-final NN",            [j("rf_subj.nii.gz"), j("rf_tmpl.nii.gz"), "-reface", j("rf_shell.nii.gz"), "-final", "NN", j("o.nii.gz")]),
+            ("ordinary+robustfov",   [j("rf_subj.nii.gz"), j("rf_tmpl.nii.gz"), "-cost", "lpa", "-reface", j("rf_shell.nii.gz"), "-robustfov", j("o.nii.gz")]),
+            ("-applymat",            [j("rf_subj.nii.gz"), j("rf_tmpl.nii.gz"), "-reface", j("rf_shell.nii.gz"), "-applymat", j("o.json"), j("o.nii.gz")]),
+            ("-interp cubic",        [j("rf_subj.nii.gz"), j("rf_tmpl.nii.gz"), "-reface", j("rf_shell.nii.gz"), "-interp", "cubic", j("o.nii.gz")]),
+            ("-fill nan",            [j("rf_subj.nii.gz"), j("rf_tmpl.nii.gz"), "-reface", j("rf_shell.nii.gz"), "-fill", "nan", j("o.nii.gz")]),
+            ("-sym",                 [j("rf_subj.nii.gz"), j("rf_tmpl.nii.gz"), "-reface", j("rf_shell.nii.gz"), "-sym", j("o.nii.gz")]),
+            # tuning-option whitelist (each must be rejected, not silently applied / silently switch engine)
+            ("-warp srs",            [j("rf_subj.nii.gz"), j("rf_tmpl.nii.gz"), "-reface", j("rf_shell.nii.gz"), "-warp", "srs", j("o.nii.gz")]),
+            ("-cmass",               [j("rf_subj.nii.gz"), j("rf_tmpl.nii.gz"), "-reface", j("rf_shell.nii.gz"), "-cmass", j("o.nii.gz")]),
+            ("-source_automask",     [j("rf_subj.nii.gz"), j("rf_tmpl.nii.gz"), "-reface", j("rf_shell.nii.gz"), "-source_automask", j("o.nii.gz")]),
+            ("-dark_automask",       [j("rf_subj.nii.gz"), j("rf_tmpl.nii.gz"), "-reface", j("rf_shell.nii.gz"), "-dark_automask", j("o.nii.gz")]),
+            ("-zoom",                [j("rf_subj.nii.gz"), j("rf_tmpl.nii.gz"), "-reface", j("rf_shell.nii.gz"), "-zoom", j("o.nii.gz")]),
+            ("-nosagseed",           [j("rf_subj.nii.gz"), j("rf_tmpl.nii.gz"), "-reface", j("rf_shell.nii.gz"), "-nosagseed", j("o.nii.gz")]),
+        ]
+        for tag, a in rej:
+            rcx, _ = run(exe, a)
+            check(f"reface rejects: {tag}", rcx != 0)
+
+        # Coded-but-UNUSABLE shell geometry must be rejected (guards the al_image_xform check,
+        # not just the no-code path): sform_code=1 but a SINGULAR sform (zero z-row), qform code 0.
+        # nibabel refuses a singular affine, so write the header fields raw (affine=None keeps them).
+        bsh = np.zeros((Nr, Nr, Nr), np.int16); bsh[16:32, 36:44, 16:32] = 200
+        bh = nib.Nifti1Header(); bh.set_data_shape(bsh.shape); bh.set_data_dtype(np.int16)
+        bh['sform_code'] = 1; bh['qform_code'] = 0
+        bh['srow_x'] = [2, 0, 0, -47]; bh['srow_y'] = [0, 2, 0, -47]; bh['srow_z'] = [0, 0, 0, 0]
+        nib.save(nib.Nifti1Image(bsh, None, header=bh), j("rf_badshell.nii.gz"))
+        rcb, _ = run(exe, [j("rf_subj.nii.gz"), j("rf_tmpl.nii.gz"), "-reface", j("rf_badshell.nii.gz"), j("o.nii.gz")])
+        check("reface rejects coded-but-singular shell geometry", rcb != 0 and not os.path.exists(j("o.nii.gz")))
+
+        # Fast + -robustfov + -reface success (an advertised interaction): must produce finite
+        # subject-grid output (the 96 mm synthetic FOV is under the 170 mm default crop, so this
+        # exercises the fast-only path and the pre-crop subject_orig capture without cropping).
+        rcr, errr = run(exe, [j("rf_subj.nii.gz"), j("rf_tmpl.nii.gz"), "-reface", j("rf_shell.nii.gz"),
+                              "-robustfov", j("rf_rfov.nii.gz")])
+        check("reface fast + -robustfov success (finite output)",
+              rcr == 0 and os.path.exists(j("rf_rfov.nii.gz")) and
+              np.all(np.isfinite(nib.load(j("rf_rfov.nii.gz")).get_fdata())),
+              f"rc={rcr}: {errr.strip()[-140:]}")
+
+        # ordinary-engine and weighted success paths (both must produce finite subject-grid output).
+        # These exercise the nii_allineate_estimate path and the -weight branch end-to-end.
+        wt = (brain > 30).astype(np.float32)                     # a trivial stationary-space weight
+        save(wt, Ar, j("rf_wt.nii.gz"), dtype=np.float32)
+        for tag, a in [
+            ("ordinary (ls)", [j("rf_subj.nii.gz"), j("rf_tmpl.nii.gz"), "-cost", "ls",
+                               "-reface", j("rf_shell.nii.gz"), j("rf_ord.nii.gz")]),
+            ("fast + weight", [j("rf_subj.nii.gz"), j("rf_tmpl.nii.gz"), "-cost", "fastcr",
+                               "-weight", j("rf_wt.nii.gz"), "-reface", j("rf_shell.nii.gz"), j("rf_wt_out.nii.gz")]),
+        ]:
+            outp = a[-1]
+            rcs, errs = run(exe, a)
+            ok = rcs == 0 and os.path.exists(outp)
+            check(f"reface {tag} success (finite subject-grid output)",
+                  ok and np.all(np.isfinite(nib.load(outp).get_fdata())) and
+                  nib.load(outp).shape == nib.load(j("rf_subj.nii.gz")).shape,
+                  f"rc={rcs}: {errs.strip()[-140:]}")
+
+        # 14b. NON-IDENTITY back-projection (privacy-critical): the §14 fixture is an identity
+        #     registration, so a reversed `inverse(fixed_to_moving)` would pass it. Here the
+        #     template is the subject TRANSLATED by a known +DZ voxels along axis 0, so the fit
+        #     recovers a real translation. A template-space shell whose −1 (zero-out) block sits
+        #     on the TEMPLATE brain must, after back-projection, zero the SUBJECT brain (shifted
+        #     back by −DZ). A reversed inverse would instead zero background → almost no brain
+        #     voxels removed. Assert both the count and the correct side.
+        print("14b. -reface non-identity back-projection direction")
+        DZ = 6   # template brain is the subject shifted +DZ voxels along axis 0 (the `cz` arg)
+        subj2 = (_rg(24, 24, 24, 8, 300) + _rg(18, 28, 24, 5, 180)).astype(np.float32)
+        tmpl2 = (_rg(24, 24, 24 + DZ, 8, 300) + _rg(18, 28, 24 + DZ, 5, 180)).astype(np.float32)
+        save(subj2, Ar, j("rf2_subj.nii.gz"), dtype=np.int16)
+        save(tmpl2, Ar, j("rf2_tmpl.nii.gz"), dtype=np.float32)
+        shell2 = np.zeros((Nr, Nr, Nr), np.float32)
+        shell2[24 + DZ - 3:24 + DZ + 4, 14:34, 14:34] = -1.0     # zero-out block on the TEMPLATE brain (axis0 ~30)
+        shell2[28:33, 22:27, 14:19] = 200.0                      # small +cube on the template brain (gives ifac a population)
+        save(shell2, Ar, j("rf2_shell.nii.gz"), dtype=np.int16)
+        rc2, err2 = run(exe, [j("rf2_subj.nii.gz"), j("rf2_tmpl.nii.gz"), "-cost", "fastcr",
+                              "-reface", j("rf2_shell.nii.gz"), j("rf2_out.nii.gz")])
+        check("reface non-identity runs", rc2 == 0, f"rc={rc2}: {err2.strip()[-160:]}")
+        if rc2 == 0:
+            si = nib.load(j("rf2_subj.nii.gz")).get_fdata()
+            oo = nib.load(j("rf2_out.nii.gz")).get_fdata()
+            zeroed_brain = (si > 50) & (oo == 0)                 # subject brain voxels removed by the shell
+            nz = int(zeroed_brain.sum())
+            # Correct direction removes a substantial brain block; a reversed inverse removes ~none.
+            check("reface non-identity removes subject brain (correct inverse direction)",
+                  nz > 200, f"only {nz} brain voxels zeroed (reversed inverse would give ~0)")
+            if nz > 0:
+                ci = np.argwhere(zeroed_brain)[:, 0].mean()      # centroid along the shifted axis
+                # Expected on the SUBJECT side (~24), NOT the template side (~24+DZ=30).
+                check("reface non-identity zeroed block on the subject side",
+                      abs(ci - 24) < abs(ci - (24 + DZ)), f"centroid i={ci:.1f} (subject~24, template~{24+DZ})")
+
     print()
     if FAILURES:
         print(f"REGRESSION FAILED — {len(FAILURES)} check(s):", file=sys.stderr)

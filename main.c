@@ -12,6 +12,7 @@
 #include "miniCoreFLT.h"
 #include "coreg_fast.h"
 #include "qwarp.h"
+#include "reface.h"
 #if defined(_OPENMP)
 	#include <omp.h>
 #endif
@@ -78,9 +79,12 @@ int show_help( void ) {
 	printf("                         sho=shift(3), shr=shift+rotate(6), srs=+scale(9), aff=+shear(12)\n");
 	printf("                       -skullstrip XX  brain mask in moving space; output = stationary\n");
 	printf("                                 with non-brain voxels set to darkest value [default final: linear]\n");
-	printf("                       -weight XX  stationary-space weight image (dims match stationary):\n");
-	printf("                                 steers the fast-engine FINE stage to a region (e.g. brain).\n");
-	printf("                                 Fast engine only (-cost fast/fastcr).\n");
+	printf("                       -weight XX  AFNI 3dAllineate-style graded weight image in stationary\n");
+	printf("                                 (base) space (dims + world frame match stationary); normalized\n");
+	printf("                                 to [0,1] and used per voxel. BOTH engines: the ordinary engine\n");
+	printf("                                 replaces its autoweight; the fast engine applies it at the\n");
+	printf("                                 FINEST (2mm) stage only (coarse capture + global scale stay\n");
+	printf("                                 whole-head). Keep the out-of-ROI head attenuated (nonzero).\n");
 	printf("                       -robustfov [mm] crop the moving image to a robust FOV (default 170mm),\n");
 	printf("                                 removing lower head/neck (emulates FSL robustfov); adjusts\n");
 	printf("                                 dim and valid sform/qform. A good pre-step before registration.\n");
@@ -93,9 +97,17 @@ int show_help( void ) {
 	printf("                       -master grid.nii  register at the stationary resolution, but reslice the\n");
 	printf("                                 output onto THIS grid (e.g. a higher-res template sharing the\n");
 	printf("                                 stationary world frame). Works with both engines. -final sets interp.\n");
+	printf("                       -reface XX  ANONYMIZE: register the moving (subject) to the stationary\n");
+	printf("                                 (template), back-project the face-replacement shell XX (a\n");
+	printf("                                 template-space image) onto the ORIGINAL subject grid, and\n");
+	printf("                                 composite an anonymized image (shell>0 replace scaled,\n");
+	printf("                                 ==0 keep, <0 zero; 3dBrickStat mean-ratio brightness match +\n");
+	printf("                                 masked edge blend). Output stays on the subject grid. Works\n");
+	printf("                                 with both engines; honors -weight; -robustfov is\n");
+	printf("                                 fast-engine only. Emulates AFNI afni_refacer2 -mode_reface.\n");
 	printf("                       -qwarp  NONLINEAR (deformable) registration; EXCLUSIVE mode. Only form:\n");
 	printf("                                 allineate <moving> <stationary> -qwarp <output>. Inputs must already\n");
-	printf("                                 be affine-aligned + skull-stripped + share the stationary grid.\n");
+	printf("                                 be unifized + affine-aligned + skull-stripped + share the stationary grid.\n");
 	printf("                                 Port of AFNI 3dQwarp -blur 0 3. No other option is accepted with it.\n");
 	printf("                       -com  set the origin to the brightness center of mass (header-only\n");
 	printf("                                 translation of the affine); a cheap centered start for\n");
@@ -283,9 +295,12 @@ static int read_affine_json(const char *path, mat44 *out) {
 
 /* Parse CLI sub-arguments.
    *ac points to the last positional arg consumed; on return it points to the
-   last sub-argument consumed. Returns 0 on success, 1 on error. */
+   last sub-argument consumed. `reface_out` (may be NULL) receives the `-reface`
+   shell filename — kept local to main.c so the shared al_opts/allineate.h stay
+   unchanged (per the reface goal's shared-source policy). Returns 0 on success,
+   1 on error. */
 static int cli_parse_subopts(int *ac, int argc, char **argv, al_opts *opts,
-                             const char *cmd_name) {
+                             const char *cmd_name, const char **reface_out) {
 	while (*ac + 1 < argc && argv[*ac + 1][0] == '-') {
 		(*ac)++;
 		if (!strcmp(argv[*ac], "-p")) {
@@ -339,6 +354,17 @@ static int cli_parse_subopts(int *ac, int argc, char **argv, al_opts *opts,
 					(*ac)++;
 				}
 			}
+		} else if (!strcmp(argv[*ac], "-reface")) {
+			(*ac)++;
+			if (*ac >= argc) {
+				fprintf(stderr, "%s -reface requires a shell image filename\n", cmd_name);
+				return 1;
+			}
+			if (!reface_out) {
+				fprintf(stderr, "%s -reface is not accepted here\n", cmd_name);
+				return 1;
+			}
+			*reface_out = argv[*ac];
 		} else {
 			/* Delegate every shared registration option to the parser copied verbatim
 			   from niimath's allineate.h. Back up to the last consumed argument first. */
@@ -351,6 +377,88 @@ static int cli_parse_subopts(int *ac, int argc, char **argv, al_opts *opts,
 		}
 	}
 	return 0;
+}
+
+/* -reface: back-project the template-space shell onto the original subject grid and
+   composite an anonymized image. `subject_orig` is the UNMODIFIED original moving
+   image (captured before any -robustfov crop); `fixed_to_moving` is the world-mm
+   FIXED(stationary)->MOVING transform from either engine. The shell shares the
+   stationary template world frame. Reslice the shell onto the subject grid with NN
+   (inverse transform), remove isolated speckle, then run the reface composite. The
+   output stays on the original subject grid. Writes `output_name` only after every
+   step succeeds. Returns 0 on success, nonzero on error. */
+static int do_reface(nifti_image *subject_orig, const char *shell_name,
+                     mat44 fixed_to_moving, const char *output_name, int isStdOut) {
+	nifti_image *shell = nifti_image_read(shell_name, 1);
+	if (!shell) { fprintf(stderr, "Failed to read -reface shell '%s'\n", shell_name); return 1; }
+	/* Single-volume 3D shell with a usable coded transform (it defines the template
+	   world frame; a no-form shell cannot be placed relative to the registration). A 4D
+	   image has nvox = nx*ny*nz*nt with nt>1, so the nvox test alone rejects it. */
+	if (shell->nvox != (size_t)shell->nx * shell->ny * shell->nz) {
+		fprintf(stderr, "-reface shell '%s' must be a single-volume 3D image\n", shell_name);
+		nifti_image_free(shell); return 1;
+	}
+	/* Require a USABLE coded transform, not merely a positive code: a shell with
+	   sform_code>0 but a singular/non-finite sform would otherwise pass here yet make
+	   nii_apply_affine silently synthesize a pixdim-centered frame (al_image_xform_or_pixdim),
+	   placing the shell wrong while reporting success. al_image_xform fails on exactly that. */
+	mat44 shell_xform;
+	if (al_image_xform(shell, &shell_xform)) {
+		fprintf(stderr, "-reface shell '%s' has no usable coded sform/qform (needed to place it in template space)\n",
+		        shell_name);
+		nifti_image_free(shell); return 1;
+	}
+	/* Convert the shell to physical float32 up front so the pre/post face-coverage counts
+	   read the same values (nii_apply_affine then takes the float alias path). */
+	if (nii_ensure_float32(shell)) {
+		fprintf(stderr, "-reface: failed to convert the shell to float32\n");
+		nifti_image_free(shell); return 1;
+	}
+	if (nii_ensure_float32(subject_orig)) {
+		fprintf(stderr, "-reface: failed to convert the subject to float32\n");
+		nifti_image_free(shell); return 1;
+	}
+	/* Face-coverage diagnostic (anonymization safety): a registration the engine reports
+	   as "successful" but that is grossly wrong can land almost none of the shell's face
+	   region on the subject, leaving the face largely UN-replaced in a written output. We
+	   cannot verify the fit, but we can measure how much of the face volume mapped into the
+	   subject FOV and warn. Use physical VOLUME (voxel count x voxel size), so the fraction
+	   is independent of the shell-vs-subject resolution difference. */
+	size_t shell_n = (size_t)shell->nx * shell->ny * shell->nz;
+	const float *sd0 = (const float *)shell->data;
+	size_t face_tmpl = 0;
+	for (size_t i = 0; i < shell_n; i++) if (sd0[i] > 0.0f) face_tmpl++;
+	double vox_tmpl = fabs((double)shell->dx * shell->dy * shell->dz);
+	/* Back-project: shell (template world frame) -> subject grid, NN, fill 0. The
+	   engine matrix is fixed->moving world; the inverse maps subject world -> template
+	   world, exactly what nii_apply_affine samples for each subject voxel. */
+	mat44 moving_to_fixed = nifti_mat44_inverse(fixed_to_moving);
+	if (nii_apply_affine(shell, subject_orig, moving_to_fixed, AL_INTERP_NN, 0.0f)) {
+		fprintf(stderr, "-reface: shell back-projection onto the subject grid failed\n");
+		nifti_image_free(shell); return 1;
+	}
+	reface_isola((float *)shell->data, shell->nx, shell->ny, shell->nz);
+	{
+		size_t sub_n = (size_t)shell->nx * shell->ny * shell->nz;
+		const float *sd1 = (const float *)shell->data;
+		size_t face_subj = 0;
+		for (size_t i = 0; i < sub_n; i++) if (sd1[i] > 0.0f) face_subj++;
+		double vox_subj = fabs((double)shell->dx * shell->dy * shell->dz);
+		double face_vol_tot = (double)face_tmpl * vox_tmpl;
+		double cov = (face_vol_tot > 0.0) ? ((double)face_subj * vox_subj) / face_vol_tot : 0.0;
+		fprintf(stderr, " + reface: %zu face voxels replaced (~%.0f%% of the shell face volume mapped into the subject FOV)\n",
+		        face_subj, 100.0 * cov);
+		if (cov < 0.10)
+			fprintf(stderr, " ! reface WARNING: low face coverage (~%.0f%%) — the registration may be wrong; "
+			                "verify the output actually removes the face\n", 100.0 * cov);
+	}
+	nifti_image *out = NULL;
+	int rc = reface_apply(subject_orig, shell, &out);
+	nifti_image_free(shell);
+	if (rc || !out) { fprintf(stderr, "-reface compositing failed\n"); return 1; }
+	rc = write_result(out, output_name, isStdOut);
+	nifti_image_free(out);
+	return rc ? 1 : 0;
 }
 
 /* Exclusive -qwarp mode: `allineate <moving> <stationary> -qwarp <output>` — a faithful
@@ -408,6 +516,8 @@ int main(int argc, char * argv[]) {
 	const char *moving_name = argv[ac];
 	ac++;
 	al_opts opts = al_opts_default();
+	/* -reface shell filename: kept local (not in al_opts) per the reface goal. */
+	const char *reface_name = NULL;
 	/* The stationary image is optional: it is present only if the next token is
 	   not a flag. Without it, we run preprocessing only (e.g. -robustfov). */
 	const char *stationary_name = NULL;
@@ -417,7 +527,7 @@ int main(int argc, char * argv[]) {
 	}
 	/* al_parse_subopts wants the index of the last positional consumed. */
 	int pac = ac - 1;
-	if (cli_parse_subopts(&pac, argc, argv, &opts, "allineate"))
+	if (cli_parse_subopts(&pac, argc, argv, &opts, "allineate", &reface_name))
 		return 1;
 	ac = pac + 1;
 	/* The output filename is the remaining positional (may be omitted in matrix-only
@@ -427,7 +537,7 @@ int main(int argc, char * argv[]) {
 	const char *output_name = (ac < argc) ? argv[ac] : NULL;
 	if (output_name && ac + 1 < argc) {
 		int pac2 = ac;   /* points at the output; consumes flags after it */
-		if (cli_parse_subopts(&pac2, argc, argv, &opts, "allineate"))
+		if (cli_parse_subopts(&pac2, argc, argv, &opts, "allineate", &reface_name))
 			return 1;
 		if (pac2 + 1 < argc) {
 			fprintf(stderr, "Unexpected extra argument '%s' after output '%s'\n",
@@ -523,12 +633,19 @@ int main(int argc, char * argv[]) {
 			return 1;
 		}
 	}
-	/* -weight (region-focused fine-stage fit) is currently implemented only for the fast
-	   engine. Reject it for the ordinary engine / -applymat / -skullstrip / preprocessing-only
-	   rather than silently ignoring it. */
-	if (opts.weight && !opts.fast) {
-		fprintf(stderr, "-weight is only supported with the fast engine (-cost fast/-cost fastcr)\n");
-		return 1;
+	/* -weight is a base(stationary)-space GRADED registration weight (AFNI 3dAllineate style),
+	   supported by BOTH engines. It requires a real registration, so reject preprocessing-only,
+	   -applymat (no registration), and -skullstrip (which uses its own template-registration path
+	   that does not consume the weight) rather than silently ignoring it. */
+	if (opts.weight) {
+		if (!stationary_name) {
+			fprintf(stderr, "-weight requires a <stationary> image (it weights the registration)\n");
+			return 1;
+		}
+		if (opts.applymat || opts.skullstrip) {
+			fprintf(stderr, "-weight is not supported with -applymat or -skullstrip\n");
+			return 1;
+		}
 	}
 	/* Reject stdin for -weight: only the moving image may be piped, and its cached buffer
 	   would otherwise be re-read and mistaken for a plausible weight when dims match. */
@@ -575,6 +692,60 @@ int main(int argc, char * argv[]) {
 			return 1;
 		}
 	}
+	/* -reface: register the subject (moving) to the template (stationary), back-project the
+	   face-replacement shell onto the ORIGINAL subject grid, and composite an anonymized image.
+	   It has fixed output semantics (subject grid, NN shell), so it rejects the other output
+	   modes and the header-seed pre-steps whose fitted matrix would be relative to a modified
+	   moving header. -robustfov is honored ONLY with the fast engine. */
+	int reface_fast_only = 0;   /* a fast-only reface option was supplied (disables default-fast fallback) */
+	if (reface_name) {
+		if (reface_name[0] == '-' && reface_name[1] == '\0') {
+			fprintf(stderr, "The -reface shell must be a file, not stdin ('-')\n");
+			return 1;
+		}
+		if (!stationary_name) {
+			fprintf(stderr, "-reface requires a <stationary> template image to register against\n");
+			return 1;
+		}
+		if (!output_name) {
+			fprintf(stderr, "-reface produces an output image; provide an output filename\n");
+			return 1;
+		}
+		if (opts.skullstrip || opts.applymat || opts.master || opts.savemat) {
+			fprintf(stderr, "-reface cannot be combined with -skullstrip/-applymat/-master/-savemat\n");
+			return 1;
+		}
+		if (opts.sym || opts.com) {
+			fprintf(stderr, "-reface cannot be combined with the header-seed pre-steps -com/-sym/-symd/-symb "
+			                "(the fitted matrix would be relative to a modified subject header)\n");
+			return 1;
+		}
+		if ((opts.cli_set & (AL_CLI_FINAL | AL_CLI_INTERP)) || opts.fillmode != AL_FILL_AUTO) {
+			fprintf(stderr, "-reface uses fixed nearest-neighbor shell resampling; "
+			                "-final/-interp/-fill are not supported with it\n");
+			return 1;
+		}
+		/* Tight option whitelist: -reface accepts only -cost, -weight, -p and (fast-engine)
+		   -robustfov. Reject the ordinary-engine tuning knobs rather than let them silently alter
+		   the fit or (for the fast-incompatible ones) silently switch reface onto the ordinary
+		   engine. -nosagseed is caught via opts.sagseed==0 (default is 1). */
+		if ((opts.cli_set & (AL_CLI_WARP | AL_CLI_CMASS)) || opts.source_automask ||
+		    opts.dark_automask || opts.zoom || opts.sagseed == 0) {
+			fprintf(stderr, "-reface does not accept registration-tuning options "
+			                "(-warp/-cmass/-nocmass/-source_automask/-dark_automask/-zoom/-nosagseed); "
+			                "it uses the engine defaults\n");
+			return 1;
+		}
+		/* Fast-only option: the robust-FOV crop is only wired on the fast path. With an explicitly
+		   selected ordinary cost it must error rather than be ignored. */
+		int explicit_ordinary = (opts.cli_set & AL_CLI_COST) && !opts.fast;
+		reface_fast_only = (opts.robustfov > 0.0);
+		if (explicit_ordinary && reface_fast_only) {
+			fprintf(stderr, "-reface with an explicit ordinary -cost does not support "
+			                "-robustfov (fast-engine only)\n");
+			return 1;
+		}
+	}
 	/* The output image is optional only in matrix-only mode: a registration with
 	   -savemat but no output filename saves just the transform. Every other mode
 	   (preprocessing, -applymat, -skullstrip, plain registration) writes an image. */
@@ -609,17 +780,30 @@ int main(int argc, char * argv[]) {
 		fprintf(stderr, "Failed to read moving image '%s'\n", moving_name);
 		goto cleanup;
 	}
+	/* -reface: retain the UNMODIFIED original subject (before any -robustfov crop). The
+	   engine fits/reslices `moving` (possibly cropped); the composite and output use this
+	   pristine copy on the original grid. robustfov preserves retained-voxel world
+	   coordinates, so the world-mm fit matrix is valid for back-projection onto it. */
+	nifti_image *subject_orig = NULL;
+	if (reface_name) {
+		subject_orig = nim_deep_copy(moving);
+		if (!subject_orig) {
+			fprintf(stderr, "-reface: failed to copy the subject image\n");
+			nifti_image_free(moving);
+			goto cleanup;
+		}
+	}
 	/* Preprocessing on the moving image (changes dims + sform/qform). Applied
 	   before registration so allineate sees the cropped geometry. */
 	if (opts.robustfov > 0.0) {
 		if (nii_ensure_float32(moving)) {
 			fprintf(stderr, "Failed to convert '%s' to float32 for -robustfov\n", moving_name);
-			nifti_image_free(moving);
+			nifti_image_free(moving); nifti_image_free(subject_orig);
 			goto cleanup;
 		}
 		if (nifti_robustfov(moving, opts.robustfov)) {
 			fprintf(stderr, "robustfov failed on '%s'\n", moving_name);
-			nifti_image_free(moving);
+			nifti_image_free(moving); nifti_image_free(subject_orig);
 			goto cleanup;
 		}
 	}
@@ -671,6 +855,7 @@ int main(int argc, char * argv[]) {
 	if (!stationary) {
 		fprintf(stderr, "Failed to read stationary image '%s'\n", stationary_name);
 		nifti_image_free(moving);
+		nifti_image_free(subject_orig);   /* NULL unless in -reface mode */
 		goto cleanup;
 	}
 	if (opts.applymat) {
@@ -760,6 +945,7 @@ int main(int argc, char * argv[]) {
 			if (!weight_img) {
 				fprintf(stderr, "Failed to read -weight image '%s'\n", opts.weight);
 				nifti_image_free(moving); nifti_image_free(stationary);
+				nifti_image_free(subject_orig);   /* NULL unless in -reface mode */
 				goto cleanup;
 			}
 			cfo.weight = weight_img;
@@ -769,24 +955,38 @@ int main(int argc, char * argv[]) {
 		int est_rc = coreg_fast_estimate(moving, stationary, &cfo, &res);
 		nifti_image_free(weight_img); weight_img = NULL;
 		if (est_rc) {
-			if (fast_default && !opts.weight) {
+			/* Default-fast fallback to the Hellinger engine keeps a bare registration robust.
+			   For -reface it is suppressed when a fast-only reface option (-robustfov) was
+			   supplied: it is not honored by the ordinary path, so silently falling back would
+			   change semantics — fail instead. */
+			if (fast_default && !reface_fast_only) {
 				/* The default fast engine could not register this image (too small/degenerate for
 				   its pyramid). Fall back to the robust Hellinger engine below so a bare
 				   registration never regresses; an explicit -cost fast/fastcr still errors.
-				   moving/stationary are intact (the failed estimate does not mutate them).
-				   NOT when -weight was requested: the ordinary engine ignores it, so silently
-				   dropping to an unweighted fit would defeat the explicit region request. */
+				   moving/stationary are intact (the failed estimate does not mutate them). Any
+				   -weight is honored on the fallback too — the ordinary engine now consumes it. */
 				fprintf(stderr, " + Fast registration failed; falling back to -cost hel\n");
 				opts.fast = 0;
 				opts.cost = AL_COST_HELLINGER;
 			} else {
 				fprintf(stderr, "Fast registration failed\n");
 				nifti_image_free(moving); nifti_image_free(stationary);
+				nifti_image_free(subject_orig);
 				goto cleanup;
 			}
 		} else {
 		fprintf(stderr, "Fast registration: %d levels, %d evals, cost=%.5f, %.0f ms\n",
 			res.levels_completed, res.evaluations, res.final_cost, res.registration_ms);
+		/* -reface: back-project the shell onto the ORIGINAL subject grid and composite an
+		   anonymized image, instead of the normal reslice-onto-stationary output. */
+		if (reface_name) {
+			int rr = do_reface(subject_orig, reface_name, res.fixed_to_moving, output_name, isStdOut);
+			nifti_image_free(stationary);
+			nifti_image_free(moving);
+			nifti_image_free(subject_orig);
+			rc = rr ? 1 : 0;
+			goto cleanup;
+		}
 		/* Only reslice the moving image if an output image is requested. Matrix-only
 		   mode (-savemat with no output) skips the full-resolution warp entirely — it
 		   costs time/memory and an unused reslice failure must not fail a valid save. */
@@ -835,6 +1035,19 @@ int main(int argc, char * argv[]) {
 		/* Normal allineate engine (an explicit non-fast -cost, or the default-fast fallback above).
 		   The -com/-sym/-sagseed header seeds were applied above (shared with the fast engine);
 		   moving is already seeded as it enters the fit. */
+		/* -reface: estimate the transform WITHOUT the reslice-then-discard that nii_allineate would
+		   do (nii_allineate_estimate does not mutate `moving`), then composite on the ORIGINAL
+		   subject grid. -master/-savemat are rejected with -reface, so this bypasses them cleanly. */
+		if (reface_name) {
+			mat44 aff;
+			int rr = nii_allineate_estimate(moving, stationary, opts, &aff)
+			         ? 1 : do_reface(subject_orig, reface_name, aff, output_name, isStdOut);
+			nifti_image_free(stationary);
+			nifti_image_free(moving);
+			nifti_image_free(subject_orig);
+			rc = rr ? 1 : 0;
+			goto cleanup;
+		}
 		/* -master: nii_allineate reslices `moving` in place onto the stationary grid, so
 		   preserve the moving image AS IT ENTERS the fit (after any -sym/-com/-robustfov
 		   pre-steps — the fitted matrix is relative to that seeded header). After the fit
@@ -855,6 +1068,7 @@ int main(int argc, char * argv[]) {
 			fprintf(stderr, "Registration failed\n");
 			nifti_image_free(moving);
 			if (master_out) nifti_image_free(master_out);
+			nifti_image_free(subject_orig);
 			goto cleanup;
 		}
 		if (opts.master) {
