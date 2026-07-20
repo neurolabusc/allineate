@@ -379,6 +379,24 @@ static int cli_parse_subopts(int *ac, int argc, char **argv, al_opts *opts,
 	return 0;
 }
 
+/* Physical voxel volume (mm^3) from the |det| of a world transform's 3x3 linear block, normalized
+   for xyz_units. Uses the coded transform that actually places/reslices the shell rather than the
+   pixdim product, so a scaled/sheared sform (or pixdims disagreeing with the coded scale) cannot
+   distort the reface coverage ratio and invert the <10% privacy gate. Mirrors niimath's
+   reface_voxvol_mm3 (coreFLT.c); kept self-contained here since miniCoreFLT has no xyz_units_to_mm. */
+static double reface_voxvol_mm3(mat44 M, int xyz_units) {
+	double det = (double)M.m[0][0] * (M.m[1][1]*M.m[2][2] - M.m[1][2]*M.m[2][1])
+	           - (double)M.m[0][1] * (M.m[1][0]*M.m[2][2] - M.m[1][2]*M.m[2][0])
+	           + (double)M.m[0][2] * (M.m[1][0]*M.m[2][1] - M.m[1][1]*M.m[2][0]);
+	double mm;
+	switch (xyz_units) {           /* normalize to mm (see niimath core.c xyz_units_to_mm) */
+		case NIFTI_UNITS_METER:  mm = 1000.0; break;
+		case NIFTI_UNITS_MICRON: mm = 0.001;  break;
+		default:                 mm = 1.0;    break;  /* NIFTI_UNITS_MM or unspecified */
+	}
+	return fabs(det) * (mm * mm * mm);
+}
+
 /* -reface: back-project the template-space shell onto the original subject grid and
    composite an anonymized image. `subject_orig` is the UNMODIFIED original moving
    image (captured before any -robustfov crop); `fixed_to_moving` is the world-mm
@@ -422,13 +440,14 @@ static int do_reface(nifti_image *subject_orig, const char *shell_name,
 	   as "successful" but that is grossly wrong can land almost none of the shell's face
 	   region on the subject, leaving the face largely UN-replaced in a written output. We
 	   cannot verify the fit, but we can measure how much of the face volume mapped into the
-	   subject FOV and warn. Use physical VOLUME (voxel count x voxel size), so the fraction
-	   is independent of the shell-vs-subject resolution difference. */
+	   subject FOV. Use physical VOLUME from the |det| of each image's coded transform (template
+	   shell vs subject, separately) so the fraction is genuinely independent of the shell-vs-subject
+	   resolution difference — the pixdim product would be wrong for a scaled/sheared sform. */
 	size_t shell_n = (size_t)shell->nx * shell->ny * shell->nz;
 	const float *sd0 = (const float *)shell->data;
 	size_t face_tmpl = 0;
 	for (size_t i = 0; i < shell_n; i++) if (sd0[i] > 0.0f) face_tmpl++;
-	double vox_tmpl = fabs((double)shell->dx * shell->dy * shell->dz);
+	double vox_tmpl = reface_voxvol_mm3(shell_xform, shell->xyz_units);
 	/* Back-project: shell (template world frame) -> subject grid, NN, fill 0. The
 	   engine matrix is fixed->moving world; the inverse maps subject world -> template
 	   world, exactly what nii_apply_affine samples for each subject voxel. */
@@ -443,14 +462,22 @@ static int do_reface(nifti_image *subject_orig, const char *shell_name,
 		const float *sd1 = (const float *)shell->data;
 		size_t face_subj = 0;
 		for (size_t i = 0; i < sub_n; i++) if (sd1[i] > 0.0f) face_subj++;
-		double vox_subj = fabs((double)shell->dx * shell->dy * shell->dz);
+		/* Subject-grid voxel volume from the |det| of the subject's own world transform — the frame
+		   nii_apply_affine sampled the shell into — so template-vs-subject is on one physical scale. */
+		mat44 subj_xform; al_image_xform_or_pixdim(subject_orig, &subj_xform, "reface subject");
+		double vox_subj = reface_voxvol_mm3(subj_xform, subject_orig->xyz_units);
 		double face_vol_tot = (double)face_tmpl * vox_tmpl;
 		double cov = (face_vol_tot > 0.0) ? ((double)face_subj * vox_subj) / face_vol_tot : 0.0;
 		fprintf(stderr, " + reface: %zu face voxels replaced (~%.0f%% of the shell face volume mapped into the subject FOV)\n",
 		        face_subj, 100.0 * cov);
-		if (cov < 0.10)
-			fprintf(stderr, " ! reface WARNING: low face coverage (~%.0f%%) — the registration may be wrong; "
-			                "verify the output actually removes the face\n", 100.0 * cov);
+		/* FAIL CLOSED for privacy (matches niimath): -reface is an anonymization command, so if
+		   almost none of the face shell reached the subject (mislocated fit or FOV mismatch) refuse
+		   to write a possibly-unanonymized image rather than warn-and-succeed. */
+		if (cov < 0.10) {
+			fprintf(stderr, "-reface: only ~%.0f%% of the face shell mapped into the subject FOV -- the "
+			                "registration likely failed; refusing to write a possibly-unanonymized image\n", 100.0 * cov);
+			nifti_image_free(shell); return 1;
+		}
 	}
 	nifti_image *out = NULL;
 	int rc = reface_apply(subject_orig, shell, &out);

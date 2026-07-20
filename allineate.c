@@ -3604,6 +3604,10 @@ static float *al_load_user_weight(const char *fname, const nifti_image *base)
     int bnx = base->nx, bny = base->ny, bnz = base->nz;
     nifti_image *wim = nifti_image_read(fname, 1);
     if (!wim) { fprintf(stderr, "allineate: cannot read -weight image '%s'\n", fname); return NULL; }
+    if (wim->nvox != (size_t)wim->nx * wim->ny * wim->nz) {
+        fprintf(stderr, "allineate: -weight must be a single 3D volume (4D not supported)\n");
+        nifti_image_free(wim); return NULL;
+    }
     if (wim->nx != bnx || wim->ny != bny || wim->nz != bnz) {
         fprintf(stderr, "allineate: -weight dims %dx%dx%d must match the base %dx%dx%d\n",
                 (int)wim->nx, (int)wim->ny, (int)wim->nz, bnx, bny, bnz);

@@ -92,24 +92,20 @@ test: all
 # drifted file so a release/CI step can gate on it separately from the correctness gate:
 #     make parity NIIMATH=/path/to/niimath
 #
-# LEADING-EDGE EXPECTATION (2026-07): `allineate.c/.h` and `coreg_fast.c/.h` currently DRIFT
-# by design — the fast-engine leading-edge features (HEL joint-foreground moving-dark skip,
-# weight-at-finest-level, `-weight`) diverge them ahead of niimath (see AGENTS.md "LEADING-EDGE
-# DIVERGENCE"). `qwarp.c/.h` and `reface.c/.h` are standalone leading-edge files not yet in
-# niimath and are intentionally NOT listed in SHARED. So `make parity` is EXPECTED to report
-# those drifts until the features are back-ported; it is a resync aid, not a hard release
-# blocker while divergence is active. The
-# always-required release gate is `make test`. `nifti_io.c/.h`, `powell_newuoa.c`, `core32.h`
-# must stay byte-identical (they are external drop-ins) — an unexpected drift THERE is the real
-# signal this check exists to catch.
-# SHARED_STABLE — external drop-ins that MUST stay byte-identical; drift here is the real
-#   defect this check exists to catch, and fails the target (nonzero exit).
-# SHARED_LEADING — files intentionally diverged ahead of niimath by active leading-edge
-#   fast-engine features (HEL joint-foreground skip, weight-at-finest-level). Drift is EXPECTED and only reported (does
-#   NOT fail), so the target can machine-distinguish it from accidental drift. When these are
-#   back-ported, move them into SHARED_STABLE and restore byte-equality.
-SHARED_STABLE  = powell_newuoa.c nifti_io.c nifti_io.h core32.h
-SHARED_LEADING = allineate.c allineate.h coreg_fast.c coreg_fast.h
+# FULLY SYNCED (2026-07): all shared registration sources are now back-ported to niimath and
+# byte-identical — the fast-engine leading-edge features (HEL joint-foreground moving-dark skip,
+# weight-at-finest-level, `-weight`) landed in niimath's `allineate.c`/`coreg_fast.c`, and
+# `reface.c/.h` + `qwarp.c/.h` are now in niimath too (reface always built; qwarp behind
+# niimath's `QWARP=1`/`ENABLE_QWARP`). So ALL of them are in SHARED_STABLE and MUST stay
+# byte-identical; any drift FAILS the target and is the signal this check exists to catch. The
+# always-required release gate is still `make test`. SHARED_LEADING is retained (empty) as the
+# mechanism for a FUTURE feature that is temporarily ahead of niimath — move a file there while
+# it leads, then back to SHARED_STABLE once back-ported.
+# SHARED_STABLE — shared drop-ins that MUST stay byte-identical with niimath; drift FAILS.
+# SHARED_LEADING — files intentionally ahead of niimath by an ACTIVE leading-edge feature;
+#   drift is only reported (does NOT fail). Currently empty (nothing is ahead).
+SHARED_STABLE  = powell_newuoa.c nifti_io.c nifti_io.h core32.h allineate.c allineate.h coreg_fast.c coreg_fast.h reface.c reface.h qwarp.c qwarp.h
+SHARED_LEADING =
 parity:
 	@test -n "$(NIIMATH)" || { echo "set NIIMATH=/path/to/niimath (its src/ holds the source of truth)"; exit 2; }
 	@rc=0; \
