@@ -18,6 +18,11 @@
                                 default cost is the fast engine (see AL_ENGINE_* below); these
                                 AL_COST_* codes select the ordinary AFNI-style engine. */
 #define AL_COST_PEARSON   3  /* Global Pearson correlation (within-modality) */
+#define AL_COST_NMI       4  /* Normalized mutual information, H(x,y)/(H(x)+H(y)) — an
+                                entropy-ratio alternative to Hellinger for images with a
+                                huge shared background/zero bin (masked or skull-stripped
+                                data), where Hellinger's sqrt(joint) term is dominated by
+                                that one concentrated cell. Minimized (1 == independent). */
 
 /* Center-of-mass modes */
 #define AL_CMASS_NONE     0  /* No center-of-mass alignment */
@@ -168,6 +173,7 @@ static inline int al_parse_cost(const char *name, int *cost_out) {
     if (!strcmp(name, "lpc"))                        { *cost_out = AL_COST_LPC; return 0; }
     if (!strcmp(name, "lpa"))                        { *cost_out = AL_COST_LPA; return 0; }
     if (!strcmp(name, "hel"))                        { *cost_out = AL_COST_HELLINGER; return 0; }
+    if (!strcmp(name, "nmi"))                        { *cost_out = AL_COST_NMI; return 0; }
     if (!strcmp(name, "ls") || !strcmp(name, "pearson")) { *cost_out = AL_COST_PEARSON; return 0; }
     return 1;
 }
@@ -224,6 +230,7 @@ static inline const char *al_cost_name(int cost) {
         case AL_COST_LPC:      return "lpc";
         case AL_COST_LPA:      return "lpa";
         case AL_COST_PEARSON:  return "ls";
+        case AL_COST_NMI:      return "nmi";
         default:               return "hel";
     }
 }
@@ -391,7 +398,7 @@ static inline int al_parse_subopts(int *ac, int argc, char **argv, al_opts *opts
                 opts->fast = AL_ENGINE_FAST_X;
                 opts->cli_set &= ~AL_CLI_COST;
             } else if (al_parse_cost(argv[*ac], &opts->cost)) {
-                fprintf(stderr, "Unknown cost function '%s' (use: fast, fastx, fasthel, fastcr, lpc, lpa, hel, ls)\n",
+                fprintf(stderr, "Unknown cost function '%s' (use: fast, fastx, fasthel, fastcr, lpc, lpa, hel, nmi, ls)\n",
                         argv[*ac]);
                 return 1;
             } else {

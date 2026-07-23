@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Synthetic capture-range and partial-FOV tests for the fast path.
+"""Synthetic capture-range, partial-FOV, and hard-zero-base tests for the fast path.
 
 For each known world affine A (FIXED->MOVING) in coreg_synth.CAPTURE_CASES we build a
 moving image whose voxel content equals a generated asymmetric phantom but whose header world
@@ -9,8 +9,13 @@ path must recover F2M with ERMS(F2M, A) <= floor over a 100 mm sphere.
 The partial-FOV cases crop one end of the moving acquisition while preserving its
 world coordinates. The true transform remains identity; the fit must not distort
 the affine merely to pull unavailable fixed anatomy inside the moving grid.
+
+The hard-zero case masks the tracked MNI template with its tracked brain mask and
+registers the tracked T1w1mm image. This is the compact regression for the coarse
+multi-start: rigid-only coarse capture lands in a wrong basin (masked NCC ~0.13),
+while carrying the scale-bracketed strategy to 2 mm recovers NCC ~0.48.
 """
-import os, sys, json, subprocess, tempfile, shutil
+import argparse, os, sys, json, subprocess, tempfile, shutil
 import numpy as np, nibabel as nib
 sys.path.insert(0, os.path.dirname(__file__))
 import coreg_synth as cs
@@ -83,7 +88,47 @@ def run_partial_fov(cost, fixed, tmp):
     return cs.erms(M, np.eye(4)), None
 
 
+def run_hard_zero_base(tmp):
+    """Return (masked_ncc, p1_equals_p4, error) for the stripped-template regression."""
+    moving = os.path.join(ROOT, "benchmark", "inputs", "T1w1mm.nii.gz")
+    template = os.path.join(ROOT, "benchmark", "templates", "MNI152_T1_1mm.nii.gz")
+    mask_path = os.path.join(ROOT, "benchmark", "masks", "MNI152_T1_1mm_brain_mask.nii.gz")
+    for path in (moving, template, mask_path):
+        if not os.path.exists(path):
+            return None, False, f"missing tracked fixture: {path}"
+
+    ti = nib.load(template)
+    td = np.asarray(ti.dataobj, dtype=np.float32)
+    md = np.asarray(nib.load(mask_path).dataobj, dtype=np.float32)
+    base_path = os.path.join(tmp, "MNI152_T1_1mm_brain.nii.gz")
+    base = nib.Nifti1Image(np.where(md > 0.5, td, 0.0).astype(np.float32),
+                           ti.affine, ti.header)
+    base.set_data_dtype(np.float32)
+    nib.save(base, base_path)
+
+    outputs = []
+    for threads in (1, 4):
+        out = os.path.join(tmp, f"hardzero_p{threads}.nii.gz")
+        try:
+            r = subprocess.run([BIN, moving, base_path, "-p", str(threads), out],
+                               capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            return None, False, f"p{threads} timeout (>120s)"
+        if r.returncode != 0 or not os.path.exists(out):
+            return None, False, f"p{threads}: {r.stderr.strip()[-120:]}"
+        outputs.append(np.asarray(nib.load(out).dataobj, dtype=np.float32))
+
+    roi = md > 0.5
+    ncc = float(np.corrcoef(outputs[1][roi], td[roi])[0, 1])
+    return ncc, np.array_equal(outputs[0], outputs[1]), None
+
+
 def main():
+    global BIN
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--allineate", default=BIN)
+    args = parser.parse_args()
+    BIN = os.path.abspath(args.allineate)
     tmp = tempfile.mkdtemp(prefix="cf_synth_")
     try:
         fixed = make_fixed(tmp)
@@ -105,6 +150,17 @@ def main():
             ok = e <= floor
             print(f"{name:14s}  {e:7.3f}   {floor:.2f}   {'PASS' if ok else 'FAIL'}")
             npass += ok; nfail += (not ok)
+        ncc, same, err = run_hard_zero_base(tmp)
+        if ncc is None:
+            print(f"{'hardzero_ncc':14s}   ---      0.40   FAIL ({err[:50]})")
+            nfail += 1
+        else:
+            ok = ncc >= 0.40
+            print(f"{'hardzero_ncc':14s}  {ncc:7.3f}   0.40   {'PASS' if ok else 'FAIL'}")
+            npass += ok; nfail += (not ok)
+            print(f"{'hardzero_p1=p4':14s}  {'yes' if same else 'no ':>7s}          "
+                  f"{'PASS' if same else 'FAIL'}")
+            npass += same; nfail += (not same)
         print(f"\n{npass} passed, {nfail} failed")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

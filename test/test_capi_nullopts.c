@@ -36,9 +36,37 @@ int main(int argc, char **argv) {
     /* The load-bearing call: NULL opts must resolve to defaults, not dereference NULL. */
     int rc = coreg_fast_estimate(mov, fix, NULL, &res);
     fprintf(stderr, "coreg_fast_estimate(NULL opts) returned %d\n", rc);
+    if (rc) {
+        nifti_image_free(mov);
+        nifti_image_free(fix);
+        return 1;
+    }
+
+    /* A rigid max_dof request must never inherit scale from an exploratory coarse seed.
+       This especially guards the hard-zero multi-start's scale-bracket strategy. */
+    coreg_fast_opts rigid = coreg_fast_opts_default();
+    rigid.max_dof = 6;
+    rc = coreg_fast_estimate(mov, fix, &rigid, &res);
+    if (rc) {
+        fprintf(stderr, "coreg_fast_estimate(max_dof=6) returned %d\n", rc);
+        nifti_image_free(mov);
+        nifti_image_free(fix);
+        return 1;
+    }
+    float det = res.fixed_to_moving.m[0][0] *
+                    (res.fixed_to_moving.m[1][1] * res.fixed_to_moving.m[2][2] -
+                     res.fixed_to_moving.m[1][2] * res.fixed_to_moving.m[2][1]) -
+                res.fixed_to_moving.m[0][1] *
+                    (res.fixed_to_moving.m[1][0] * res.fixed_to_moving.m[2][2] -
+                     res.fixed_to_moving.m[1][2] * res.fixed_to_moving.m[2][0]) +
+                res.fixed_to_moving.m[0][2] *
+                    (res.fixed_to_moving.m[1][0] * res.fixed_to_moving.m[2][1] -
+                     res.fixed_to_moving.m[1][1] * res.fixed_to_moving.m[2][0]);
+    fprintf(stderr, "coreg_fast_estimate(max_dof=6) returned %d, dof=%d, det=%.7g\n",
+            rc, res.resolved_dof, det);
     nifti_image_free(mov);
     nifti_image_free(fix);
-    if (rc) return 1;
+    if (res.resolved_dof != 6 || !(det > 0.9999f && det < 1.0001f)) return 1;
 
     /* A Gaussian radius wider than its row must be clipped before integer conversion
        and allocation; only three samples can contribute here despite the tiny spacing. */

@@ -53,10 +53,11 @@ int show_help( void ) {
 	printf(" <moving> [opts] <output>            : preprocess only (e.g. -robustfov), no registration\n");
 	printf("                 Use '-' for <moving> to read from stdin, '-' for <output> to write to stdout\n");
 	printf("                 opts: -cost XX  cost function:\n");
-	printf("                                 options: fast/fastx (default), fasthel, fastcr, hel, lpc, lpa, ls;\n");
-	printf("                                 'fast'/'fastx' let HEL and CR coarse fits compete\n");
+	printf("                                 options: fast/fastx (default), fasthel, fastcr, hel, nmi, lpc, lpa, ls;\n");
+	printf("                                 'fast'/'fastx' adapt capture to whole-head/hard-zero bases\n");
 	printf("                                 'fasthel' forces HEL-only fast registration\n");
 	printf("                                 'hel' (Hellinger) is a robust cross-modal method\n");
+	printf("                                 'nmi' is ordinary normalized mutual information\n");
 	printf("                                 Other cost functions for special cases\n");
 	printf("                                 The fast engine has a fixed config: -warp/-interp/\n");
 	printf("                                 -source_automask/-dark_automask/-zoom/-skullstrip are\n");
@@ -612,7 +613,7 @@ int main(int argc, char * argv[]) {
 	   degenerate volume falls back to the Hellinger engine below, so a bare registration never
 	   regresses. Modes with their own engine (-applymat, -skullstrip) and preprocessing-only runs
 	   (no stationary) keep their paths; an explicit -cost
-	   (fast/fastx/fasthel/fastcr or hel/lpc/lpa/ls) wins.
+	   (fast/fastx/fasthel/fastcr or hel/nmi/lpc/lpa/ls) wins.
 	   The fast engine cannot honor -zoom/-source_automask/-dark_automask/-warp/-interp; if the
 	   user gave any of those WITHOUT an explicit -cost fast, stay on the ordinary engine rather
 	   than defaulting to fast and erroring (an explicit -cost fast + such an option still errors

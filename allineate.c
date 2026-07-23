@@ -101,6 +101,7 @@ static nifti_dmat44 mat44_to_dmat44(mat44 f) {
 
 /* Cost function method codes (subset of AFNI's full list) */
 #define GA_MATCH_PEARSON_SCALAR        1
+#define GA_MATCH_NORMUTIN_SCALAR       5  /* Normalized Mutual Info (AFNI numbering) */
 #define GA_MATCH_HELLINGER_SCALAR      7
 #define GA_MATCH_PEARSON_LOCALS       11  /* pure lpc (signed local Pearson) */
 #define GA_MATCH_PEARSON_LOCALA       12  /* pure lpa (absolute local Pearson) */
@@ -2374,6 +2375,21 @@ static double GA_scalar_costfun(int meth, int npt,
             val = -(double)hmc.a; /* aligned → hmc.a > 0 → val negative → good for min */
         } break;
 
+        case GA_MATCH_NORMUTIN_SCALAR: { /* Normalized mutual information (cross-modal) */
+            float_quad hmc;
+            hmc = al_helmicra(npt, gstup->hxc_bot, gstup->hxc_top, avm,
+                                   gstup->hyc_bot, gstup->hyc_top, bvm, wvm,
+                                   gstup->aj_topclip, gstup->bs_topclip);
+            if (al_hist_oom) return (double)AL_BIGVAL; /* histogram OOM: reject, not a cost-0 "win" */
+            /* hmc.c = H(x,y)/(H(x)+H(y)): already a MINIMIZED cost (1 == independent,
+               -> ~0.5 as the images become perfectly dependent). Unlike Hellinger's
+               sqrt(joint*marginal*marginal) sum, entropy weights a bin by p*log(p), so a
+               single huge shared-background cell contributes a bounded amount instead of
+               dominating -- the reason this is the better choice on masked/skull-stripped
+               pairs. Same sign convention AFNI uses for its `-cost nmi`. */
+            val = (double)hmc.c;
+        } break;
+
         case GA_MATCH_PEARSON_LOCALS:  /* pure lpc (signed local Pearson) */
             val = (double)GA_pearson_local(npt, avm, bvm, wvm);
         break;
@@ -2618,7 +2634,8 @@ static void al_scalar_setup(GA_setup *stup)
        pure wasted work — a full-image quantile per axis, a per-stage sample clipate, and a
        discarded sequential warm-up eval. Gate it on the cost so those paths skip it. The default
        (Hellinger) is byte-for-byte unchanged (hist_cost == 1). */
-    int hist_cost = (stup->match_code == GA_MATCH_HELLINGER_SCALAR);
+    int hist_cost = (stup->match_code == GA_MATCH_HELLINGER_SCALAR ||
+                     stup->match_code == GA_MATCH_NORMUTIN_SCALAR);
 #ifdef AL_LPC_MICHO
     hist_cost = hist_cost || stup->match_code == GA_MATCH_LPC_MICHO_SCALAR
                           || stup->match_code == GA_MATCH_LPA_MICHO_SCALAR;
@@ -3422,6 +3439,7 @@ static void al_resolve_cost(int cost, int *match_out, const char **name_out)
         case AL_COST_LPA:       *match_out = GA_MATCH_PEARSON_LOCALA;   *name_out = "lpa"; return;
 #endif
         case AL_COST_PEARSON:   *match_out = GA_MATCH_PEARSON_SCALAR;   *name_out = "Pearson"; return;
+        case AL_COST_NMI:       *match_out = GA_MATCH_NORMUTIN_SCALAR;  *name_out = "NMI"; return;
         default:
         case AL_COST_HELLINGER: *match_out = GA_MATCH_HELLINGER_SCALAR; *name_out = "Hellinger"; return;
     }
@@ -3907,6 +3925,7 @@ static int al_register(nifti_image *source, nifti_image *base,
 #ifdef AL_LPC_MICHO
     if (match_code == GA_MATCH_PEARSON_SCALAR  ||
         match_code == GA_MATCH_HELLINGER_SCALAR ||
+        match_code == GA_MATCH_NORMUTIN_SCALAR  ||
         match_code == GA_MATCH_PEARSON_LOCALS   ||
         match_code == GA_MATCH_PEARSON_LOCALA) {
         stup.micho_mi = stup.micho_nmi = stup.micho_crA = stup.micho_hel = stup.micho_ov = 0.0;

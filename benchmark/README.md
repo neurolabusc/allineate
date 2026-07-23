@@ -3,7 +3,7 @@
 A small, repeatable benchmark of registration quality/speed/memory on a fixed set of images. Mixed fast capture is the default, so the ordinary AFNI-style engine must be selected explicitly with `-cost hel`:
 
 - **allineate** — `allineate <mov> <fix> -cost hel out` (AFNI-style ordinary engine, 12-DOF affine, Hellinger cost)
-- **fast / fastx** — `allineate <mov> <fix> out` or `-cost fast[x]` (the **default**: HEL/CR coarse competition, then HEL fine stages)
+- **fast / fastx** — `allineate <mov> <fix> out` or `-cost fast[x]` (the **default**: mixed HEL/CR whole-head capture; full-depth multi-start for a hard-zeroed base)
 - **fasthel**   — `allineate <mov> <fix> -cost fasthel out` (HEL-only fast path)
 - **fast robust** — `allineate <mov> <fix> -robustfov -com -cost fast out` (crop and recenter before the fast fit)
 - **AFNI**      — `3dAllineate -base <fix> -source <mov> -prefix out` (reference tool, defaults; only with `--afni`)
@@ -41,9 +41,18 @@ python3 benchmark.py --afni   # also benchmark AFNI 3dAllineate (must be on PATH
 
 Every plain template AND every `weighted/` template pair is benchmarked by default (no flag). A `weighted/<T>.nii.gz` template must ship a `weighted/<T>_weight.nii.gz` sibling; each input is registered to it with the AFNI-style graded `-weight`, and the masked cost is scored inside the weight plateau (`weight > 0.3·max`). All benchmark data lives under `benchmark/` (`inputs/`, `templates/`, `masks/`, `weighted/`); the benchmark reads nothing outside it.
 
-The `fast` engine's hard-zeroed-base robustness (e.g. an `@SSwarper` SSW template) comes from the HEL cost's **base-gated joint-foreground moving-dark skip** (`CF_HEL_MDARK_BASEFRAC`/`CF_HEL_MDARK_FRAC`; see the fast-engine notes in `AGENTS.md`) — a zero-cost per-sample test enabled only when the stationary/base image has a dominant exact-minimum background. Whole-head bases retain moving-air pairs because those are observed coverage evidence; dropping them made a hard-zeroed, small-head-in-large-FOV moving image collapse into a wrong pitch/scale basin. (An earlier full-resolution unifize coarse-pass discrimination that served the same purpose was removed 2026-07 once the gated skip superseded it; unifize remains available in niimath for manual chaining.)
+The `fast` engine's hard-zeroed-base robustness (e.g. an `@SSwarper` SSW template) combines two mechanisms gated by the same full-resolution base detector (`>25%` of voxels exactly at the minimum). First, the HEL cost's joint-foreground moving-dark skip removes the moving-bin-zero independence floor. Second, the search runs rigid HEL, bounded scale-bracketed HEL, and CR-seeded HEL as independent strategies through the 2 mm 7-DOF stage, then applies 9/12-DOF polish only to the winner. This is necessary because a skull-stripped base can make the correct orientation score worse when scale is locked at 8 mm; pruning at 4 mm was empirically unsafe. Whole-head bases retain the faster mixed strategy byte-for-byte.
 
 The default mixed strategy is the capture hedge for a hard-zeroed MOVING image against a whole-head base, where the base gate correctly leaves the HEL histogram untouched but the coarse HEL landscape can still be shallow. At 8 mm it fits HEL×affine, HEL×COM, CR×affine, and CR×COM as independent candidates; OpenMP runs up to four optimizers concurrently. It re-scores the candidates with HEL dependence×overlap and runs the 4/2 mm HEL stages once. Use `fasthel` or `fastcr` to force a single-cost path.
+
+For the dedicated hard-zeroed matrix, run:
+
+```bash
+python3 hardzero.py              # default binary, all available threads
+python3 hardzero.py -p 1         # deterministic serial comparison
+```
+
+The script uses the committed SSW base and generates brain-only MNI152/avg152 bases in a temporary directory from the committed templates and masks. It reports masked Hellinger for every modality and masked NCC for T1 inputs. No stripped-image duplicates are stored. The four decisive same-modality checks currently reproduce the imported results: ARC→SSW 0.3357, T1w1mm→MNI-strip 0.4770, ARC→avg-strip 0.4972, and MICCAI→avg-strip 0.0994 NCC. See [weighted.md](weighted.md) for the failure analysis and before/after summary.
 
 Each engine runs every (stationary, moving) pair at **1 thread** and at **all cores** (N = `os.cpu_count()`), so one table per engine carries both the single- and multi-thread cost plus the speed-up. Match quality is a post-hoc **Hellinger-affinity** metric (`benchmark/hellinger.py`): the Hellinger distance of the joint 2D intensity histogram from independence — statistical DEPENDENCE between corresponding voxels (higher = better). Unlike NCC it assumes no linear intensity relationship, so it is valid for cross-modal pairs (T2/fMRI → T1) and comparable across engines (it is independent of each engine's own registration cost).
 

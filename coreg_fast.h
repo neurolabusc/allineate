@@ -2,8 +2,7 @@
 #define COREG_FAST_H
 
 /* Fast affine coregistration path (`-cost fast`/`-cost fastx`/`-cost fasthel`/
- * `-cost fastcr`) — an
- * SPM/FLIRT-inspired, but
+ * `-cost fastcr`) — an SPM/FLIRT-inspired, but
  * independently implemented, multiresolution 12-DOF affine estimator for 3D adult
  * human brain images. It is a distinct registration tier — selected via `-cost fast`,
  * which is the CLI default, but a SEPARATE estimator that does NOT change nii_allineate()'s
@@ -32,10 +31,11 @@
                             §7 synthetic Gaussian phantoms) — a property of MI on smooth data, not
                             a defect on real scans; the synthetic capture suites use '-cost fastcr'. */
 #define CF_COST_HEL_CR 3 /* default / '-cost fast' / '-cost fastx': independently fit the 8 mm
-                            rigid coarse stage from
-                            supplied-affine/COM starts with HEL and CR, select the resulting
-                            candidate with HEL dependence*overlap, then continue at 4/2 mm with
-                            HEL. This is a mode selector, never passed to cf_cost_eval directly. */
+                            rigid coarse stage from supplied-affine/COM starts with HEL and CR.
+                            Whole-head bases select by HEL dependence*overlap and continue once.
+                            Hard-zeroed bases additionally carry scale-bracketed HEL and CR-seeded
+                            strategies through the 2 mm 7-DOF arbiter, then polish only the winner.
+                            This is a mode selector, never passed to cf_cost_eval directly. */
 
 typedef struct {
     int cost;          /* CF_COST_* (default CF_COST_HEL_CR) */
@@ -85,7 +85,7 @@ static inline coreg_fast_opts coreg_fast_opts_default(void) {
 
 /* Estimate the fast-path affine. Inputs are not modified. On success writes
  * *result and returns 0. On failure returns nonzero and leaves *result unchanged.
- * Serial-only (process-global cost context). */
+ * Serial-only at the host-call level (fastx uses callback TLS for its internal coarse jobs). */
 int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
                         const coreg_fast_opts *opts, coreg_fast_result *result);
 
