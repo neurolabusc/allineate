@@ -53,8 +53,9 @@ int show_help( void ) {
 	printf(" <moving> [opts] <output>            : preprocess only (e.g. -robustfov), no registration\n");
 	printf("                 Use '-' for <moving> to read from stdin, '-' for <output> to write to stdout\n");
 	printf("                 opts: -cost XX  cost function:\n");
-	printf("                                 options: fast (default), hel, lpc, lpa, ls, fastcr;\n");
-	printf("                                 'fast' is SPM/FLIRT inspired affine\n");
+	printf("                                 options: fast/fastx (default), fasthel, fastcr, hel, lpc, lpa, ls;\n");
+	printf("                                 'fast'/'fastx' let HEL and CR coarse fits compete\n");
+	printf("                                 'fasthel' forces HEL-only fast registration\n");
 	printf("                                 'hel' (Hellinger) is a robust cross-modal method\n");
 	printf("                                 Other cost functions for special cases\n");
 	printf("                                 The fast engine has a fixed config: -warp/-interp/\n");
@@ -332,8 +333,10 @@ static int cli_parse_subopts(int *ac, int argc, char **argv, al_opts *opts,
 			opts->skullstrip = argv[*ac];
 		} else if (!strcmp(argv[*ac], "-fast") || !strcmp(argv[*ac], "-fasthel")) {
 			fprintf(stderr, "%s: -fast/-fasthel were replaced by cost selectors — use "
-			                "'-cost fast' (fast engine, Hellinger; robust cross-modal) or "
-			                "'-cost fastcr' (fast engine, correlation-ratio)\n", cmd_name);
+			                "'-cost fast'/'-cost fastx' (mixed HEL/CR fast engine), "
+			                "'-cost fasthel' (fast engine, Hellinger only), or "
+			                "'-cost fastcr' (fast engine, correlation-ratio), or "
+			                "'-cost hel' (ordinary AFNI-style engine)\n", cmd_name);
 			return 1;
 		} else if (!strcmp(argv[*ac], "-coreg")) {
 			fprintf(stderr, "%s: -coreg was replaced by '-cost fast' "
@@ -608,7 +611,8 @@ int main(int argc, char * argv[]) {
 	   stationary pair with no explicit -cost and no special mode). A fast failure on a tiny or
 	   degenerate volume falls back to the Hellinger engine below, so a bare registration never
 	   regresses. Modes with their own engine (-applymat, -skullstrip) and preprocessing-only runs
-	   (no stationary) keep their paths; an explicit -cost (fast/fastcr or hel/lpc/lpa/ls) wins.
+	   (no stationary) keep their paths; an explicit -cost
+	   (fast/fastx/fasthel/fastcr or hel/lpc/lpa/ls) wins.
 	   The fast engine cannot honor -zoom/-source_automask/-dark_automask/-warp/-interp; if the
 	   user gave any of those WITHOUT an explicit -cost fast, stay on the ordinary engine rather
 	   than defaulting to fast and erroring (an explicit -cost fast + such an option still errors
@@ -619,13 +623,15 @@ int main(int argc, char * argv[]) {
 	int fast_default = !(opts.cli_set & AL_CLI_COST) && !opts.fast &&
 	                   stationary_name && !opts.applymat && !opts.skullstrip && !fast_incompatible;
 	if (fast_default)
-		opts.fast = AL_ENGINE_FAST_HEL;
-	/* The fast engine (-cost fast/-cost fastcr) is a distinct estimator: it needs a
+		opts.fast = AL_ENGINE_FAST_X;
+	/* The fast engine (-cost fast/-cost fastx/-cost fasthel/-cost fastcr) is a distinct
+	   estimator: it needs a
 	   stationary image. It consumes the -com/-sym header seeds (applied below, before the
 	   engine branch) but cannot compose with -skullstrip or -zoom (the latter relaxes the
 	   affine scale range the fast pyramid's fixed scale capture cannot widen). */
 	if (opts.fast) {
-		const char *fflag = (opts.fast == AL_ENGINE_FAST_HEL) ? "-cost fast" : "-cost fastcr";
+		const char *fflag = (opts.fast == AL_ENGINE_FAST_HEL) ? "-cost fasthel" :
+		                    (opts.fast == AL_ENGINE_FAST_CR)  ? "-cost fastcr" : "-cost fast/fastx";
 		if (!stationary_name && !opts.applymat) {
 			fprintf(stderr, "%s requires a <stationary> image to register against\n", fflag);
 			return 1;
@@ -636,7 +642,8 @@ int main(int argc, char * argv[]) {
 			return 1;
 		}
 		/* The fast engine has a FIXED configuration (the cost is chosen by the selector —
-		   correlation-ratio for '-cost fastcr', Hellinger for '-cost fast' — 12-DOF affine, its
+		   correlation-ratio for '-cost fastcr', Hellinger for '-cost fasthel', HEL/CR coarse
+		   competition for '-cost fast'/'-cost fastx' — 12-DOF affine, its
 		   own matching interpolation, its own internal COM seeding). Reject allineate tuning options
 		   the user explicitly passed rather than silently ignoring them (an ignored option would
 		   also make -savemat metadata misleading). Only -final (output interpolation) and
@@ -690,7 +697,7 @@ int main(int argc, char * argv[]) {
 		}
 		if (opts.fast || opts.savemat || opts.skullstrip || opts.sym || opts.com || opts.robustfov > 0.0) {
 			fprintf(stderr, "-applymat does no registration; it cannot be combined with "
-			                "-cost fast/-cost fastcr/-savemat/-skullstrip/-sym/-com/-robustfov\n");
+			                "-cost fast/fastx/fasthel/fastcr/-savemat/-skullstrip/-sym/-com/-robustfov\n");
 			return 1;
 		}
 		if ((opts.cli_set & (AL_CLI_COST | AL_CLI_WARP | AL_CLI_INTERP | AL_CLI_CMASS)) ||
@@ -953,12 +960,13 @@ int main(int argc, char * argv[]) {
 		}
 	  }
 	  if (opts.fast) {
-		/* Fast SPM/FLIRT-inspired affine path (-cost fast / -cost fastcr). Estimates a world-mm
+		/* Fast SPM/FLIRT-inspired affine path (-cost fast/fastx/fasthel/fastcr).
+		   Estimates a world-mm
 		   FIXED->MOVING affine without mutating the inputs, then reslices the moving
 		   image onto the stationary grid once. Result-based -savemat. */
 		coreg_fast_opts cfo = coreg_fast_opts_default();
-		cfo.cost = (opts.fast == AL_ENGINE_FAST_HEL) ? CF_COST_HEL   /* -cost fast:   Hellinger */
-		                                             : CF_COST_CR;   /* -cost fastcr: correlation-ratio */
+		cfo.cost = (opts.fast == AL_ENGINE_FAST_HEL) ? CF_COST_HEL :
+		           (opts.fast == AL_ENGINE_FAST_CR)  ? CF_COST_CR  : CF_COST_HEL_CR;
 		/* -com and -nocmass are strict overrides; otherwise auto-select initialization. */
 		cfo.use_cmass = !opts.com &&
 		                 !((opts.cli_set & AL_CLI_CMASS) && opts.cmass == AL_CMASS_NONE);
@@ -989,7 +997,7 @@ int main(int argc, char * argv[]) {
 			if (fast_default && !reface_fast_only) {
 				/* The default fast engine could not register this image (too small/degenerate for
 				   its pyramid). Fall back to the robust Hellinger engine below so a bare
-				   registration never regresses; an explicit -cost fast/fastcr still errors.
+				   registration never regresses; an explicit fast-engine selector still errors.
 				   moving/stationary are intact (the failed estimate does not mutate them). Any
 				   -weight is honored on the fallback too — the ordinary engine now consumes it. */
 				fprintf(stderr, " + Fast registration failed; falling back to -cost hel\n");
@@ -1047,7 +1055,8 @@ int main(int argc, char * argv[]) {
 		}
 		/* Record the validated fast-engine configuration actually used. */
 		const char *fast_cost = (res.resolved_cost == CF_COST_LS) ? "ls" :
-		                        (res.resolved_cost == CF_COST_HEL) ? "hel" : "cr";
+		                        (res.resolved_cost == CF_COST_HEL) ? "hel" :
+		                        (res.resolved_cost == CF_COST_CR) ? "cr" : "hel+cr";
 		if (opts.savemat &&
 		    write_affine_json(opts.savemat, res.fixed_to_moving, "coreg_fast", res.resolved_dof,
 		                      fast_cost, stationary_name, moving_name, opts.weight)) {

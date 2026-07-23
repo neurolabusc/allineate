@@ -5,7 +5,9 @@ quality for each engine in its own table (`fast` is the default cost, so the ord
 AFNI-style engine is selected explicitly with `-cost hel`):
 
   * allineate  — `allineate <mov> <fix> -cost hel out`  (AFNI-style ordinary engine)
-  * fast       — `allineate <mov> <fix> out`            (SPM/FLIRT-inspired path, now the DEFAULT, Hellinger cost)
+  * fast       — `allineate <mov> <fix> out`            (DEFAULT: HEL/CR coarse competition)
+  * fasthel    — `allineate <mov> <fix> -cost fasthel out` (HEL-only fast path)
+  * fastx      — `allineate <mov> <fix> -cost fastx out` (explicit alias of the default)
   * fast-robust — `allineate <mov> <fix> -robustfov -com -cost fast out`
   * AFNI       — `3dAllineate -base <fix> -source <mov> -prefix out` (reference; only with --afni)
 
@@ -23,6 +25,8 @@ Outputs go to outputs/ (untracked; they overwrite freely). Markdown tables are p
 Usage:
     python3 benchmark.py                 # allineate + fast engines
     python3 benchmark.py --engine allineate  # only the ordinary AFNI-style engine (-cost hel)
+    python3 benchmark.py --engine fasthel    # HEL-only fast path
+    python3 benchmark.py --engine fastx      # explicit mixed-default selector
     python3 benchmark.py --engine fast-robust  # robust preprocessing + fast engine
     python3 benchmark.py --afni          # also benchmark AFNI 3dAllineate (must be on PATH)
     python3 benchmark.py --allineate ../allineate
@@ -135,6 +139,8 @@ def _run_afni(mov, fix, out, threads, allineate, timeout, weight=None):
 ENGINES = {
     "allineate": _run_allineate(["-cost", "hel"]),
     "fast": _run_allineate(["-cost", "fast"]),
+    "fasthel": _run_allineate(["-cost", "fasthel"]),
+    "fastx": _run_allineate(["-cost", "fastx"]),
     "fast-robust": _run_allineate(["-robustfov", "-com", "-cost", "fast"]),
     "afni": _run_afni,
 }
@@ -175,11 +181,13 @@ def main():
     ap.add_argument("--afni", action="store_true",
                     help="also benchmark AFNI 3dAllineate (must be on PATH)")
     ap.add_argument("--engine",
-                    choices=("both", "allineate", "fast", "fast-robust", "afni"),
+                    choices=("both", "allineate", "fast", "fasthel", "fastx", "fast-robust", "afni"),
                     default="both",
-                    help="engine(s) to benchmark (default: both = allineate+fast). 'fast-robust' adds "
-                         "-robustfov -com to the fast engine; 'afni' selects AFNI 3dAllineate "
-                         "standalone (or add it with --afni)")
+                    help="engine(s) to benchmark (default: both = allineate+fastx). 'fasthel' "
+                         "forces HEL-only; 'fastx' explicitly selects the mixed default; "
+                         "'fast-robust' adds -robustfov -com to the fast engine; "
+                         "'afni' selects AFNI 3dAllineate standalone "
+                         "(or add it with --afni)")
     ap.add_argument("--timeout", type=int, default=3600,
                     help="per-registration timeout in seconds (default: 3600)")
     ap.add_argument("--weight", metavar="WEIGHTIMG",
@@ -296,7 +304,9 @@ def main():
           f"brain mask). The `1` columns are single-thread, the `{N_THREADS}` columns use all cores.\n")
     wsuf = " + `-weight`" if args.weight else ""
     titles = {"allineate": "allineate ordinary engine (`-cost hel`)" + wsuf,
-              "fast": "fast (`-cost fast`, the default)" + wsuf,
+              "fast": "fast mixed coarse (`-cost fast`, the default)" + wsuf,
+              "fasthel": "fast HEL-only (`-cost fasthel`)" + wsuf,
+              "fastx": "fast mixed coarse (`-cost fastx`, explicit default)" + wsuf,
               "fast-robust": "fast robust (`-robustfov -com -cost fast`)" + wsuf,
               "afni": "AFNI 3dAllineate (reference, defaults)" + wsuf}
     for engine in engines:

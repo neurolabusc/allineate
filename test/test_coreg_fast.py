@@ -97,7 +97,7 @@ def main():
             ok = e <= floor
             print(f"{name:14s}  {e:7.3f}   {floor:.2f}   {'PASS' if ok else 'FAIL'}")
             npass += ok; nfail += (not ok)
-        for cost, floor in (("fastcr", 0.10), ("fast", 1.00)):
+        for cost, floor in (("fastcr", 0.10), ("fasthel", 1.00)):
             name = f"partial_{cost}"
             e, err = run_partial_fov(cost, fixed, tmp)
             if e is None:

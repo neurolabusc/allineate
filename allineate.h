@@ -26,10 +26,11 @@
 /* Registration engine selector (al_opts.fast). The fast engine (coreg_fast.c) is a distinct
    estimator that is the CLI DEFAULT (via `-cost fast`); the value also carries which fast cost
    to use. The CLI default lives in the dispatch, not here — `al_opts_default()` leaves
-   `.fast = 0` and the command dispatch sets AL_ENGINE_FAST_HEL when no -cost is given. */
+   `.fast = 0` and the command dispatch sets AL_ENGINE_FAST_X when no -cost is given. */
 #define AL_ENGINE_ALLINEATE 0  /* ordinary AFNI-style allineate engine (nii_allineate; -cost hel/lpc/lpa/ls) */
 #define AL_ENGINE_FAST_CR   1  /* fast engine, correlation-ratio cost  (-cost fastcr) */
-#define AL_ENGINE_FAST_HEL  2  /* fast engine, Hellinger cost          (-cost fast; the default) */
+#define AL_ENGINE_FAST_HEL  2  /* fast engine, Hellinger cost          (-cost fasthel) */
+#define AL_ENGINE_FAST_X    3  /* fast engine, HEL/CR coarse compete  (-cost fast/-cost fastx; default) */
 
 /* al_opts.cli_set bits — which override options the user explicitly passed. Split
    matching-interp (-interp) from output-interp (-final/-nearest/-linear/-cubic): the
@@ -47,7 +48,7 @@
    -warp/-zoom — it DOES honor the -com/-sym header seeds) are separate and enforced at dispatch. */
 #define AL_CAP_TUNING  0x1u   /* -cost <normal>/-warp/-interp/-cmass/-nocmass/-source_automask/-dark_automask */
 #define AL_CAP_FINAL   0x2u   /* -final / -nearest / -linear / -cubic (output interpolation) */
-#define AL_CAP_FAST    0x4u   /* -cost fast / -cost fastcr (fast engine) */
+#define AL_CAP_FAST    0x4u   /* -cost fast / fastx / fasthel / fastcr (fast engine) */
 #define AL_CAP_MASTER  0x8u   /* -master <grid> */
 #define AL_CAP_MATRIX  0x10u  /* -savemat / -applymat */
 #define AL_CAP_SEED    0x20u  /* -com / -sym / -symd / -symb / -nosagseed / -zoom */
@@ -368,25 +369,34 @@ static inline int al_parse_subopts(int *ac, int argc, char **argv, al_opts *opts
                 fprintf(stderr, "%s -cost requires a cost function name\n", cmd_name);
                 return 1;
             }
-            /* Two `-cost` values select the FAST engine rather than an allineate cost:
-               `fast` = Hellinger (robust cross-modal), `fastcr` = correlation-ratio.
+            /* Four names select the FAST engine rather than an allineate cost:
+               `fast`/`fastx` = HEL/CR coarse competition followed by HEL fine stages,
+               `fasthel` = Hellinger only, `fastcr` = correlation-ratio only.
                `-cost` is last-one-wins: a normal cost after `-cost fast` clears the fast
                engine selection (and vice-versa) so the final `-cost` always decides. */
             if (!strcmp(argv[*ac], "fast")) {
                 AL_NEED(AL_CAP_FAST, "-cost fast");
-                opts->fast = AL_ENGINE_FAST_HEL;
+                opts->fast = AL_ENGINE_FAST_X;
                 opts->cli_set &= ~AL_CLI_COST;   /* fast overrides an earlier ordinary -cost (symmetric last-one-wins) */
+            } else if (!strcmp(argv[*ac], "fasthel")) {
+                AL_NEED(AL_CAP_FAST, "-cost fasthel");
+                opts->fast = AL_ENGINE_FAST_HEL;
+                opts->cli_set &= ~AL_CLI_COST;
             } else if (!strcmp(argv[*ac], "fastcr")) {
                 AL_NEED(AL_CAP_FAST, "-cost fastcr");
                 opts->fast = AL_ENGINE_FAST_CR;
                 opts->cli_set &= ~AL_CLI_COST;
+            } else if (!strcmp(argv[*ac], "fastx")) {
+                AL_NEED(AL_CAP_FAST, "-cost fastx");
+                opts->fast = AL_ENGINE_FAST_X;
+                opts->cli_set &= ~AL_CLI_COST;
             } else if (al_parse_cost(argv[*ac], &opts->cost)) {
-                fprintf(stderr, "Unknown cost function '%s' (use: fast, fastcr, lpc, lpa, hel, ls)\n",
+                fprintf(stderr, "Unknown cost function '%s' (use: fast, fastx, fasthel, fastcr, lpc, lpa, hel, ls)\n",
                         argv[*ac]);
                 return 1;
             } else {
                 AL_NEED(AL_CAP_TUNING, "-cost");
-                opts->fast = 0;   /* normal cost overrides an earlier -cost fast/fastcr */
+                opts->fast = 0;   /* normal cost overrides an earlier fast-engine selector */
                 opts->cli_set |= AL_CLI_COST;
             }
         } else {

@@ -398,13 +398,37 @@ def main():
             check("coreg fast savemat records engine=coreg_fast dof=12 cost=cr",
                   meta.get("engine") == "coreg_fast" and meta.get("dof") == 12 and meta.get("cost") == "cr",
                   f"engine={meta.get('engine')} dof={meta.get('dof')} cost={meta.get('cost')}")
-        # -cost fast selects the Hellinger cost (its recovery is validated on real sharp images in
+        # -cost fasthel selects the Hellinger-only cost (its recovery is validated on real sharp images in
         # test_coreg_fast.py; on the smooth synthetic phantom MI is imprecise, so only check wiring).
         hjson = j("cf_hel.json")
-        rc, err = run(exe, [j("cf_mov_identity.nii.gz"), j("cf_fix.nii.gz"), "-cost", "fast", "-savemat", hjson])
+        rc, err = run(exe, [j("cf_mov_identity.nii.gz"), j("cf_fix.nii.gz"),
+                            "-cost", "fasthel", "-savemat", hjson])
         ok = rc == 0 and os.path.exists(hjson) and _json.load(open(hjson)).get("cost") == "hel"
-        check("coreg -cost fast accepted + savemat records cost=hel", ok,
+        check("coreg -cost fasthel accepted + savemat records cost=hel", ok,
               f"rc={rc}: {err.strip()[-120:]}")
+        # The default, `fast`, and `fastx` all select mixed coarse capture and must serialize the
+        # same resolved strategy. fastx fits the 8 mm stage from both available initial frames
+        # under HEL and CR, then selects with HEL dependence*overlap.
+        xjson = j("cf_fastx.json")
+        rc, err = run(exe, [j("cf_mov_identity.nii.gz"), j("cf_fix.nii.gz"),
+                            "-cost", "fastx", "-savemat", xjson])
+        ok = rc == 0 and os.path.exists(xjson) and _json.load(open(xjson)).get("cost") == "hel+cr"
+        check("coreg -cost fastx accepted + savemat records cost=hel+cr", ok,
+              f"rc={rc}: {err.strip()[-120:]}")
+        fjson = j("cf_fast_alias.json")
+        djson = j("cf_fast_default.json")
+        rcf, errf = run(exe, [j("cf_mov_identity.nii.gz"), j("cf_fix.nii.gz"),
+                              "-cost", "fast", "-savemat", fjson])
+        rcd, errd = run(exe, [j("cf_mov_identity.nii.gz"), j("cf_fix.nii.gz"),
+                              "-savemat", djson])
+        fm = _json.load(open(fjson)) if rcf == 0 and os.path.exists(fjson) else {}
+        dm = _json.load(open(djson)) if rcd == 0 and os.path.exists(djson) else {}
+        xm = _json.load(open(xjson)) if os.path.exists(xjson) else {}
+        aliases = (fm.get("cost") == "hel+cr" and dm.get("cost") == "hel+cr" and
+                   fm.get("fixed_to_moving") == xm.get("fixed_to_moving") ==
+                   dm.get("fixed_to_moving"))
+        check("bare default, -cost fast, and -cost fastx are identical mixed capture",
+              aliases, f"fast rc={rcf}: {errf.strip()[-80:]}; default rc={rcd}: {errd.strip()[-80:]}")
 
         # -cost is last-one-wins, matching niimath's shared parser: a normal cost after
         # fastcr switches back to the ordinary engine rather than becoming a rejected
@@ -444,7 +468,7 @@ def main():
                     COREG_FAST_MAXLV="1", COREG_FAST_THR="0.4", COREG_FAST_SEED="hdr")
         mj = j("cf_env_ignored.json")
         p = subprocess.run([exe, j("cf_mov_identity.nii.gz"), j("cf_fix.nii.gz"),
-                            "-cost", "fast", "-savemat", mj], capture_output=True, text=True,
+                            "-cost", "fasthel", "-savemat", mj], capture_output=True, text=True,
                            timeout=120, env=envd)
         metae = _json.load(open(mj)) if os.path.exists(mj) else {}
         baseh = _json.load(open(hjson)) if os.path.exists(hjson) else {}
@@ -777,11 +801,11 @@ def main():
         check("reface p1 == p4 bit-identical", both and np.array_equal(
               nib.load(j("rf_p1.nii.gz")).get_fdata(), nib.load(j("rf_p4.nii.gz")).get_fdata()))
 
-        # default fast engine (HEL) path also produces valid finite subject-grid output
+        # default mixed fast path also produces valid finite subject-grid output
         rcd, errd = run(exe, [j("rf_subj.nii.gz"), j("rf_tmpl.nii.gz"),
                               "-reface", j("rf_shell.nii.gz"), j("rf_def.nii.gz")])
         okd = rcd == 0 and os.path.exists(j("rf_def.nii.gz"))
-        check("reface default (fast HEL) produces finite subject-grid output",
+        check("reface default (mixed fastx) produces finite subject-grid output",
               okd and np.all(np.isfinite(nib.load(j("rf_def.nii.gz")).get_fdata())) and
               nib.load(j("rf_def.nii.gz")).shape == nib.load(j("rf_subj.nii.gz")).shape,
               f"rc={rcd}: {errd.strip()[-140:]}")
