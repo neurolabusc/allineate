@@ -406,6 +406,16 @@ def main():
         ok = rc == 0 and os.path.exists(hjson) and _json.load(open(hjson)).get("cost") == "hel"
         check("coreg -cost fasthel accepted + savemat records cost=hel", ok,
               f"rc={rc}: {err.strip()[-120:]}")
+        # Ordinary normalized mutual information is a public cost selector. Its detailed
+        # registration behavior is descriptive, but parser/dispatch/serialization must remain
+        # wired end-to-end rather than shipping an untested user-facing option.
+        nmijson = j("cf_nmi.json")
+        rc, err = run(exe, [j("cf_mov_identity.nii.gz"), j("cf_fix.nii.gz"),
+                            "-cost", "nmi", "-savemat", nmijson])
+        nmeta = _json.load(open(nmijson)) if rc == 0 and os.path.exists(nmijson) else {}
+        check("ordinary -cost nmi accepted + savemat records engine/cost",
+              nmeta.get("engine") == "allineate" and nmeta.get("cost") == "nmi",
+              f"rc={rc}: {err.strip()[-120:]}")
         # The default, `fast`, and `fastx` all select mixed coarse capture and must serialize the
         # same resolved strategy. fastx fits the 8 mm stage from both available initial frames
         # under HEL and CR, then selects with HEL dependence*overlap.

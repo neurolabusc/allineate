@@ -3,6 +3,8 @@ allineate
 allineate.baseline
 /test_capi_nullopts
 /test_qwarp_capi
+/test_coreg_fast_nms
+/test_powell_bounds
 
 # Object files
 *.o
@@ -16,7 +18,7 @@ allineate.baseline
 /qwarp/
 /weight/
 /reface/
-audit*.md
+/audit_temp.md
 
 # macOS
 .DS_Store

@@ -25,6 +25,9 @@
 #include "coreg_fast.h"
 #include "core32.h"         /* nifti_smooth_gauss_f32 */
 #include "allineate.h"      /* al_image_xform, nii_reslice_affine, AL_INTERP_* */
+#include "al_thread_local.h"
+#include "al_size_guard.h"
+#include "coreg_fast_nms.h"
 
 extern int powell_newuoa(int ndim, double *x, double rstart, double rend,
                          int maxcall, double (*ufunc)(int, double *));
@@ -145,6 +148,7 @@ static double g_prof_blur = 0.0, g_prof_resample = 0.0;
  * survive refinement), whereas allowing the z ratio wins by a decisive margin (0.8937). */
 #define CF_CSC_N 3
 #define CF_CZR_N 2
+static const double CF_ANG[5] = {-30,-15,0,15,30};
 
 /* -weight uses AFNI 3dAllineate's scheme: a base(fixed)-space GRADED weight, normalized to
  * [0,1] over the whole fixed grid (divide by its max), applied per fixed sample. It is NOT a
@@ -208,8 +212,9 @@ static int cf_dims_ok(const nifti_image *n, const char *who) {
     /* The engine and the blur/transpose helpers use `int` for the voxel count, sample
        count, and row/transpose offsets, so the spatial product must fit `int` — bound
        it once here (matches al_safe_nvox), not scattered through inner loops. */
-    if (a*b*c > (size_t)INT_MAX) {
-        fprintf(stderr, "coreg fast: %s voxel count exceeds int range\n", who); return 1; }
+    size_t nvox = a*b*c;
+    if (nvox > (size_t)INT_MAX || !al_float_nvox_fits((uint64_t)nvox)) {
+        fprintf(stderr, "coreg fast: %s voxel count exceeds supported range\n", who); return 1; }
     return 0;
 }
 
@@ -307,7 +312,9 @@ static int cf_build_level(const float *src, int snx, int sny, int snz,
      * index math (nx*ny) downstream. */
     double dLx = ceil(snx * vx / sep_mm), dLy = ceil(sny * vy / sep_mm), dLz = ceil(snz * vz / sep_mm);
     if (dLx < 1) dLx = 1; if (dLy < 1) dLy = 1; if (dLz < 1) dLz = 1;
-    if (dLx > INT_MAX || dLy > INT_MAX || dLz > INT_MAX || dLx*dLy*dLz > (double)INT_MAX)
+    if (dLx > INT_MAX || dLy > INT_MAX || dLz > INT_MAX ||
+        dLx*dLy*dLz > (double)INT_MAX ||
+        dLx*dLy*dLz > (double)(AL_SIZE_MAX / sizeof(float)))
         return 1;
     /* Resource bound (not just index): a pyramid level must never GROSSLY up-sample the source
        (that only happens for out-of-envelope inputs — a source whose pixdim is far coarser than
@@ -413,10 +420,19 @@ typedef struct {
     int    evals;
 } cf_ctx;
 
-#ifdef _OPENMP
-static __thread cf_ctx *g_cf = NULL;
-#else
-static cf_ctx *g_cf = NULL;
+static AL_THREAD_LOCAL cf_ctx *g_cf = NULL;
+
+#ifdef COREG_FAST_TEST_ALLOC
+/* Test-only fault injection: fail the second sample-array allocation on the
+ * requested cf_make_samples call. This exercises a partial allocation after an
+ * earlier multi-start strategy has completed without changing release behavior. */
+static int g_cf_test_fail_sample_call = 0;
+static int g_cf_test_sample_calls = 0;
+void coreg_fast_test_fail_samples_on_call(int call) {
+    g_cf_test_fail_sample_call = call;
+    g_cf_test_sample_calls = 0;
+}
+int coreg_fast_test_sample_call_count(void) { return g_cf_test_sample_calls; }
 #endif
 
 /* Build the world-mm FIXED->MOVING affine from normalized params about centre c. */
@@ -672,6 +688,16 @@ static double cf_sample_coverage(const double p[12]) {
     return c->ns ? (double)nin / c->ns : 0.0;
 }
 
+/* All initialization/candidate choices use this SAME overlap-aware dependence
+ * score. Keep the arithmetic order stable: raw minimized cost times overlap would
+ * reward low overlap, while (1-cost)*overlap rewards useful statistical support. */
+static double cf_dependence_overlap_score(double cost, double overlap) {
+    double dep = 1.0 - cost;
+    if (!cf_finite(dep) || dep < 0.0 || cost >= CF_PENALTY) dep = 0.0;
+    if (dep > 1.0) dep = 1.0;
+    return dep * overlap;
+}
+
 /* NEWUOA callback (cf_cost_eval already counts the evaluation). */
 static double cf_ufunc(int n, double *x) {
     (void)n;
@@ -685,9 +711,24 @@ static double cf_ufunc(int n, double *x) {
 
 /* Build the fixed sample set (foreground voxels) for the current fixed level and
  * precompute per-cost statistics. Frees any previous set. */
+static void cf_free_samples(cf_ctx *c) {
+    free(c->sx); free(c->sy); free(c->sz); free(c->fval); free(c->fbin); free(c->cr_acc); free(c->fwt);
+    c->sx=NULL; c->sy=NULL; c->sz=NULL; c->fval=NULL; c->fbin=NULL; c->cr_acc=NULL; c->fwt=NULL;
+    c->ns=0; c->K=0; c->fwt_total=0.0; c->fmean=0.0; c->fvar=0.0;
+}
+
 static int cf_make_samples(cf_ctx *c, int K) {
     const cf_level *Lf = c->Lf;
     size_t nv = (size_t)Lf->nx * Lf->ny * Lf->nz;
+#ifdef COREG_FAST_TEST_ALLOC
+    int inject_partial_oom =
+        (++g_cf_test_sample_calls == g_cf_test_fail_sample_call);
+    if (inject_partial_oom) g_cf_test_fail_sample_call = 0; /* fail once */
+#endif
+    /* A failed rebuild must leave an EMPTY, internally consistent sample state.
+       This is load-bearing for multi-start: a later strategy must never polish a
+       prior winner with stale ns against partial replacement arrays. */
+    cf_free_samples(c);
     /* foreground threshold: 5% of dynamic range above min */
     double mn = DBL_MAX, mx = -DBL_MAX;
     for (size_t i = 0; i < nv; i++) { float v = Lf->data[i]; if (v<mn) mn=v; if (v>mx) mx=v; }
@@ -697,15 +738,24 @@ static int cf_make_samples(cf_ctx *c, int K) {
     int ns = 0;
     for (size_t i = 0; i < nv; i++) if (Lf->data[i] > thr) ns++;
     if (ns < 16) return 1;
-    free(c->sx); free(c->sy); free(c->sz); free(c->fval); free(c->fbin); free(c->fwt);
-    c->fwt = NULL;
-    c->sx = malloc(sizeof(int32_t)*ns); c->sy = malloc(sizeof(int32_t)*ns);
+    c->sx = malloc(sizeof(int32_t)*ns);
+#ifdef COREG_FAST_TEST_ALLOC
+    c->sy = inject_partial_oom ? NULL : malloc(sizeof(int32_t)*ns);
+#else
+    c->sy = malloc(sizeof(int32_t)*ns);
+#endif
     c->sz = malloc(sizeof(int32_t)*ns); c->fval = malloc(sizeof(float)*ns);
     c->fbin = malloc(sizeof(int)*ns);
-    if (!c->sx||!c->sy||!c->sz||!c->fval||!c->fbin) return 1;
+    if (!c->sx||!c->sy||!c->sz||!c->fval||!c->fbin) {
+        cf_free_samples(c);
+        return 1;
+    }
     /* Optional per-sample weight: the weight level shares Lf's grid, so the sample voxel
        index below reads it directly. Absent (Lw==NULL) leaves fwt NULL -> unweighted. */
-    if (c->Lw) { c->fwt = malloc(sizeof(float)*ns); if (!c->fwt) return 1; }
+    if (c->Lw) {
+        c->fwt = malloc(sizeof(float)*ns);
+        if (!c->fwt) { cf_free_samples(c); return 1; }
+    }
     double inv = (mx > mn) ? (K - 1) / (mx - mn) : 0.0;
     int idx = 0; double sum = 0;
     for (int z = 0; z < Lf->nz; z++)
@@ -733,6 +783,7 @@ static int cf_make_samples(cf_ctx *c, int K) {
        per-pose weighted-coverage floor (N >= 10% of fwt_total) is retained for the accepted case. */
     if (c->fwt && !(fwt_max > 1e-3)) {
         fprintf(stderr, "coreg fast: -weight is never positive over the fixed foreground\n");
+        cf_free_samples(c);
         return 1;
     }
     c->ns = ns; c->K = K;
@@ -745,15 +796,9 @@ static int cf_make_samples(cf_ctx *c, int K) {
     size_t blk = 3*(size_t)K + 4;
     size_t hblk = (size_t)CF_HEL_NBIN*CF_HEL_NBIN + 1;
     if (hblk > blk) blk = hblk;
-    free(c->cr_acc);
     c->cr_acc = (double *)malloc((size_t)CF_CR_NCHUNK * blk * sizeof(double));
-    if (!c->cr_acc) return 1;
+    if (!c->cr_acc) { cf_free_samples(c); return 1; }
     return 0;
-}
-
-static void cf_free_samples(cf_ctx *c) {
-    free(c->sx); free(c->sy); free(c->sz); free(c->fval); free(c->fbin); free(c->cr_acc); free(c->fwt);
-    c->sx=NULL; c->sy=NULL; c->sz=NULL; c->fval=NULL; c->fbin=NULL; c->cr_acc=NULL; c->fwt=NULL;
 }
 
 /* Set the active free-dof subset for a stage. dof: 6/7/9/12. */
@@ -802,32 +847,29 @@ typedef struct {
 } cf_coarse_job;
 
 static void cf_run_coarse_job(cf_coarse_job *j) {
-    typedef struct { double p[12]; double c; } cf_coarse_cand;
-    static const double ANG[5] = {-30,-15,0,15,30};
     const int NTOP = 3;
     cf_ctx *c = &j->c;
     c->serial_cost = 1;
     g_cf = c;
+    float old_mfac, old_afac;
+    powell_get_mfac(&old_mfac, &old_afac);
     powell_set_mfac(j->mfac, j->afac);
 
     double bp[12]; memcpy(bp, j->seed, sizeof bp);
-    cf_coarse_cand top[3];
+    cf_nms_candidate top[3]; memset(top, 0, sizeof top);
     for (int i=0; i<NTOP; i++) top[i].c = CF_PENALTY;
     if (j->coarse_search) {
         for (int a=0; a<5; a++) for (int b=0; b<5; b++) for (int cc=0; cc<5; cc++) {
             double p[12]; memcpy(p, bp, sizeof p);
-            p[3]=bp[3]+ANG[a]*CF_DEG2RAD/CF_PS_ROT;
-            p[4]=bp[4]+ANG[b]*CF_DEG2RAD/CF_PS_ROT;
-            p[5]=bp[5]+ANG[cc]*CF_DEG2RAD/CF_PS_ROT;
+            p[3]=bp[3]+CF_ANG[a]*CF_DEG2RAD/CF_PS_ROT;
+            p[4]=bp[4]+CF_ANG[b]*CF_DEG2RAD/CF_PS_ROT;
+            p[5]=bp[5]+CF_ANG[cc]*CF_DEG2RAD/CF_PS_ROT;
             p[6]=p[7]=p[8]=0.0;
             double cv = cf_cost_eval(p);
-            for (int t=0; t<NTOP; t++) if (cv < top[t].c) {
-                for (int u=NTOP-1; u>t; u--) top[u]=top[u-1];
-                memcpy(top[t].p, p, sizeof p); top[t].c=cv; break;
-            }
+            cf_insert_sorted_candidate(top, NTOP, p, cv, (size_t)((a*5+b)*5+cc));
         }
     } else {
-        memcpy(top[0].p, bp, sizeof bp); top[0].c=cf_cost_eval(bp);
+        memcpy(top[0].p, bp, sizeof bp); top[0].c=cf_cost_eval(bp); top[0].order=0;
     }
 
     double seedbest = CF_PENALTY;
@@ -840,6 +882,7 @@ static void cf_run_coarse_job(cf_coarse_job *j) {
     }
     j->result_cost = seedbest;
     powell_newuoa_free_threadlocal();
+    powell_set_mfac(old_mfac, old_afac);
     g_cf = NULL;
 }
 
@@ -1103,6 +1146,10 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
                    ? ((O.cost == CF_COST_HEL_CR) ? CF_NSTRAT :
                       (O.cost == CF_COST_HEL || O.cost == CF_COST_CR) ? 2 : 1)
                    : 1;
+    int sample_err = 0;
+#ifdef COREG_FAST_TEST_ALLOC
+    g_cf_test_sample_calls = 0;
+#endif
     for (int strat = 0; strat < nstrat; strat++) {
       ncand = 0;
       levels_done = 0;
@@ -1137,7 +1184,7 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
         int _ev0 = ctx.evals; double _tsamp0 = cf_wtime();
 #endif
         int K = (int)lround(256.0 / SEP[lv]); if (K<32) K=32; if (K>256) K=256;
-        if (cf_make_samples(&ctx, K)) break;
+        if (cf_make_samples(&ctx, K)) { sample_err = 1; break; }
         double rstart = SEP[lv], rend = SEP[lv]*0.03;
 #ifdef AL_PROFILE
         double _tsamp = cf_wtime() - _tsamp0, _topt0 = cf_wtime();
@@ -1188,12 +1235,8 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
               } else {
                   double hc = cf_cost_eval(hp), cc = cf_cost_eval(cp);
                   double hov = cf_sample_coverage(hp), cov = cf_sample_coverage(cp);
-                  double hd = 1.0 - hc, cd = 1.0 - cc;
-                  if (!cf_finite(hd) || hd < 0.0 || hc >= CF_PENALTY) hd = 0.0;
-                  if (!cf_finite(cd) || cd < 0.0 || cc >= CF_PENALTY) cd = 0.0;
-                  if (hd > 1.0) hd = 1.0;
-                  if (cd > 1.0) cd = 1.0;
-                  double hs = hd * hov, cs = cd * cov;
+                  double hs = cf_dependence_overlap_score(hc, hov);
+                  double cs = cf_dependence_overlap_score(cc, cov);
                   if (cs > hs) memcpy(seeds[0], cp, sizeof cp);
                   if (O.verbose)
                       fprintf(stderr, "[coreg fast] initial affine cost=%.5f overlap=%.5f score=%.5f; "
@@ -1205,8 +1248,7 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
           /* Search and refine the selected start. Whole-head fastx independently searches both
              available frames under both coarse costs; the hard-zero path instead gives HEL,
              scale-bracketed HEL, and CR their own full-depth strategies. */
-          typedef struct { double p[12]; double c; } cand;
-          const double ANG[5] = {-30,-15,0,15,30};
+          typedef cf_nms_candidate cand;
           const int NTOP = (strat == 0) ? 3 : 6;   /* pass 0 == historical */
           /* RIGID coarse (8 mm): lock global scale at identity and search only
              orientation+translation. Freeing scale this coarse lets the correlation-ratio
@@ -1221,7 +1263,9 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
             /* Historical fast/fastcr path: keep its ordering and arithmetic unchanged. */
             for (int sd=0; sd<nseed; sd++) {
               double bp[12]; memcpy(bp,seeds[sd],sizeof bp);
-              cand top[6]; for (int i=0;i<NTOP;i++) top[i].c=CF_PENALTY;
+              cand top[6]; memset(top, 0, sizeof top);
+              for (int i=0;i<NTOP;i++) top[i].c=CF_PENALTY;
+              cand pool[5*5*5*CF_CSC_N*CF_CZR_N]; size_t npool = 0;
               if (O.coarse_search) {
                   /* strat 0: rigid (scale locked at identity) -- the historical trajectory.
                      strat 1: also bracket an isotropic scale x z-ratio, searched JOINTLY with
@@ -1239,36 +1283,33 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
                   for (int a=0;a<5;a++) for (int b=0;b<5;b++) for (int cc=0;cc<5;cc++)
                   for (int sI=0; sI<nsc; sI++) for (int zI=0; zI<nzr; zI++) {
                       double p[12]; memcpy(p,bp,sizeof p);
-                      p[3]=bp[3]+ANG[a]*CF_DEG2RAD/CF_PS_ROT;
-                      p[4]=bp[4]+ANG[b]*CF_DEG2RAD/CF_PS_ROT;
-                      p[5]=bp[5]+ANG[cc]*CF_DEG2RAD/CF_PS_ROT;
+                      p[3]=bp[3]+CF_ANG[a]*CF_DEG2RAD/CF_PS_ROT;
+                      p[4]=bp[4]+CF_ANG[b]*CF_DEG2RAD/CF_PS_ROT;
+                      p[5]=bp[5]+CF_ANG[cc]*CF_DEG2RAD/CF_PS_ROT;
                       if (!explore_scale) { p[6]=p[7]=p[8]=0.0; }
                       else { p[6]=p[7]=(CSC[sI]-1.0)/CF_PS_SCALE;
                              p[8]=(CSC[sI]*CZR[zI]-1.0)/CF_PS_SCALE; }
                       double cv = cf_cost_eval(p);
-                      /* Angular non-maximum suppression: the raw top-N of a 5x5x5 grid are all
-                         neighbours of ONE minimum, which carries no diversity to the 4 mm stage.
-                         Keep entries >= 20 deg apart so the list holds DISTINCT basins. */
-                      int merged = 0;
-                      if (strat != 0)   /* NMS only on the exploratory pass */
-                      for (int t=0;t<NTOP;t++) {
-                          if (top[t].c >= CF_PENALTY) continue;
-                          double d0=(p[3]-top[t].p[3])*CF_PS_ROT/CF_DEG2RAD;
-                          double d1=(p[4]-top[t].p[4])*CF_PS_ROT/CF_DEG2RAD;
-                          double d2=(p[5]-top[t].p[5])*CF_PS_ROT/CF_DEG2RAD;
-                          if (sqrt(d0*d0+d1*d1+d2*d2) < 20.0) {
-                              if (cv < top[t].c) { memcpy(top[t].p,p,sizeof p); top[t].c=cv; }
-                              merged = 1; break;
-                          }
+                      if (strat != 0) {
+                          memcpy(pool[npool].p, p, sizeof p);
+                          pool[npool].c = cv;
+                          pool[npool].order = npool;
+                          npool++;
+                      } else {
+                          cf_insert_sorted_candidate(top, NTOP, p, cv, npool);
                       }
-                      if (!merged)
-                          for (int t=0;t<NTOP;t++) if (cv < top[t].c) {
-                              for (int u=NTOP-1;u>t;u--) top[u]=top[u-1];
-                              memcpy(top[t].p,p,sizeof p); top[t].c=cv; break;
-                          }
+                  }
+                  /* The exploratory grid's raw top-N tends to contain neighbours of one
+                     minimum. Select globally by cost before greedily retaining distinct
+                     basins; in-place replacement can break ordering and separation. */
+                  if (strat != 0) {
+                      int nsel = cf_select_angular_nms(
+                          pool, npool, top, NTOP, 20.0,
+                          CF_PS_ROT/CF_DEG2RAD, CF_PENALTY);
+                      for (int t=nsel; t<NTOP; t++) top[t].c=CF_PENALTY;
                   }
               } else {
-                  memcpy(top[0].p,bp,sizeof bp); top[0].c=cf_cost_eval(bp);
+                  memcpy(top[0].p,bp,sizeof bp); top[0].c=cf_cost_eval(bp); top[0].order=0;
               }
               double seedbest = CF_PENALTY; double seedp[12]; memcpy(seedp,bp,sizeof seedp);
               int kmax_cand = (strat == 0) ? 1 : 3;
@@ -1348,10 +1389,7 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
               for (int i=0; i<ncoarse; i++) {
                   double hc = cf_cost_eval(coarse_cand[i]);
                   double ov = cf_sample_coverage(coarse_cand[i]);
-                  double dep = 1.0 - hc;
-                  if (!cf_finite(dep) || dep < 0.0 || hc >= CF_PENALTY) dep = 0.0;
-                  if (dep > 1.0) dep = 1.0;
-                  double score = dep * ov;
+                  double score = cf_dependence_overlap_score(hc, ov);
                   if (O.verbose)
                       fprintf(stderr, "[coreg fast]  fastx candidate %d HEL=%.5f overlap=%.5f "
                                       "score=%.5f\n", i, hc, ov, score);
@@ -1410,16 +1448,17 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
                 double cv = cf_refine(&ctx, (O.max_dof<7)?O.max_dof:7, cp, SEP[lv]*0.5, SEP[lv]*0.02, 250);
                 /* Same overlap-aware score the seed selector uses: raw cost alone can prefer a
                    pose that slides the base foreground out of the moving FOV. */
-                double ov = cf_sample_coverage(cp), dep = 1.0 - cv;
-                if (!cf_finite(dep) || dep < 0.0 || cv >= CF_PENALTY) dep = 0.0;
-                if (dep > 1.0) dep = 1.0;
-                double sc = dep * ov;
+                double ov = cf_sample_coverage(cp);
+                double sc = cf_dependence_overlap_score(cv, ov);
                 if (sc > selbest) { selbest = sc; memcpy(selp, cp, sizeof selp); }
             }
             memcpy(best, selp, sizeof best);
         } else { /* lv == 2: only the 7-DOF refine here -- see the polish note below */
             cf_refine(&ctx, (O.max_dof>=7)?7:6, best, SEP[lv]*0.5,  SEP[lv]*0.02, 200);
         }
+        /* Any optimizer allocation failure is fatal and atomic; do not spend more
+           work on finer levels or later strategies when success is impossible. */
+        if (ctx.opt_err) break;
 #ifdef AL_PROFILE
         double _topt = cf_wtime() - _topt0;
         fprintf(stderr, " [coreg profile] level %g mm (%dx%dx%d): samples %.3f s (%d pts), "
@@ -1432,6 +1471,7 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
         if (O.verbose) fprintf(stderr, "[coreg fast] start %d: level %g mm done, cost=%.5f evals=%d\n",
                                strat, SEP[lv], final_cost, ctx.evals);
       }
+      if (sample_err || ctx.opt_err) break;
       /* Keep the better start by FINE-level cost (strictly, so pass 0 wins ties and an
          unchanged pair keeps its historical trajectory byte-for-byte). */
       if (levels_done == nlv && final_cost < CF_PENALTY && (!have_all || final_cost < cost_all)) {
@@ -1440,7 +1480,9 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
       if (O.verbose) fprintf(stderr, "[coreg fast] start %d final cost=%.5f (best so far %.5f)\n",
                              strat, final_cost, cost_all);
     }
-    if (have_all) { memcpy(best, best_all, sizeof best); final_cost = cost_all; levels_done = nlv; }
+    if (!sample_err && !ctx.opt_err && have_all) {
+        memcpy(best, best_all, sizeof best); final_cost = cost_all; levels_done = nlv;
+    }
     /* Final 9- and 12-DOF polish, for the WINNING start only. The multi-start needs every
        start carried to 2 mm (the 4 mm cost is NOT a safe arbiter: it disagrees with the 2 mm
        winner on 25/40 cases and would cost up to +0.064, losing M2017->SSW and both
@@ -1451,7 +1493,7 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
        7-DOF result and polishing once recovers roughly half the multi-start's cost.
        ctx is still configured for the finest level (samples depend only on the FIXED level, so
        they are identical for every start) -- do not reorder this above the strategy loop. */
-    if (levels_done == nlv && final_cost < CF_PENALTY) {
+    if (!sample_err && !ctx.opt_err && levels_done == nlv && final_cost < CF_PENALTY) {
         if (O.max_dof >= 9)  cf_refine(&ctx, 9,  best, SEP[nlv-1]*0.35, SEP[nlv-1]*0.015, 250);
         if (O.max_dof >= 12) cf_refine(&ctx, 12, best, SEP[nlv-1]*0.25, SEP[nlv-1]*0.01,  350);
         final_cost = cf_cost_eval(best);
@@ -1469,6 +1511,8 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
        and the final affine passes validity. Any earlier failure leaves *result
        unchanged (the documented contract). A shortened DEBUG schedule (nlv<3) still
        requires all nlv levels to complete — it is distinct from a construction failure. */
+    if (sample_err) {
+        fprintf(stderr, "coreg fast: sample construction failed\n"); return 1; }
     if (levels_done < nlv) {
         fprintf(stderr, "coreg fast: level %d/%d failed (sample build)\n", levels_done, nlv); return 1; }
     if (opt_err) { fprintf(stderr, "coreg fast: optimizer error (allocation failure?)\n"); return 1; }

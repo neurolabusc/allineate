@@ -24,6 +24,7 @@ Outputs go to outputs/ (untracked; they overwrite freely). Markdown tables are p
 
 Usage:
     python3 benchmark.py                 # allineate + fast engines
+    python3 benchmark.py --multi-only    # initial all-core regression sweep
     python3 benchmark.py --engine allineate  # only the ordinary AFNI-style engine (-cost hel)
     python3 benchmark.py --engine fasthel    # HEL-only fast path
     python3 benchmark.py --engine fastx      # explicit mixed-default selector
@@ -158,8 +159,22 @@ def _fmt(x, nd=4):
     return f"{x:.{nd}f}" if x is not None and not (isinstance(x, float) and np.isnan(x)) else "n/a"
 
 
-def markdown_table(rows):
+def markdown_table(rows, multi_only=False):
     """rows: (stationary, moving, t1, ram1, tn, ramn, speedup, cost, cost_masked)."""
+    if multi_only:
+        hdr = ["Stationary", "Moving", f"{N_THREADS} Time", f"{N_THREADS} Peak RAM",
+               "Cost", "Cost Masked"]
+        lines = ["| " + " | ".join(hdr) + " |",
+                 "|" + "|".join(["---"] * len(hdr)) + "|"]
+        for st, mv, _t1, _ram1, tn, ramn, _sp, cost, cm in rows:
+            def s(x, nd=1):
+                return f"{x:.{nd}f}" if x is not None and not (
+                    isinstance(x, float) and np.isnan(x)) else "FAIL"
+            lines.append(
+                f"| {st} | {mv} | {s(tn)} | {s(ramn, 0)} | "
+                f"{_fmt(cost)} | {_fmt(cm)} |")
+        return "\n".join(lines)
+
     hdr = ["Stationary", "Moving", "1 Time", "1 Peak RAM",
            f"{N_THREADS} Time", f"{N_THREADS} Peak RAM", "Speed Up", "Cost", "Cost Masked"]
     lines = ["| " + " | ".join(hdr) + " |",
@@ -183,13 +198,17 @@ def main():
     ap.add_argument("--engine",
                     choices=("both", "allineate", "fast", "fasthel", "fastx", "fast-robust", "afni"),
                     default="both",
-                    help="engine(s) to benchmark (default: both = allineate+fastx). 'fasthel' "
+                    help="engine(s) to benchmark (default: both = allineate+fast, where 'fast' "
+                         "is the mixed-default selector). 'fasthel' "
                          "forces HEL-only; 'fastx' explicitly selects the mixed default; "
                          "'fast-robust' adds -robustfov -com to the fast engine; "
                          "'afni' selects AFNI 3dAllineate standalone "
                          "(or add it with --afni)")
     ap.add_argument("--timeout", type=int, default=3600,
                     help="per-registration timeout in seconds (default: 3600)")
+    ap.add_argument("--multi-only", action="store_true",
+                    help="run only the all-core pass and print compact regression tables; "
+                         "omit the 1-thread pass and speed-up columns")
     ap.add_argument("--weight", metavar="WEIGHTIMG",
                     help="weighted-registration mode: pass `-weight WEIGHTIMG` to every engine "
                          "(AFNI 3dAllineate-style graded weight), register only to --base, and score "
@@ -265,14 +284,17 @@ def main():
     tables = {e: [] for e in engines}
     n_fail = 0
     for engine in engines:
-        sys.stderr.write(f"\n=== engine: {engine} (1 and {N_THREADS} threads) ===\n")
+        mode_label = f"{N_THREADS} threads only" if args.multi_only else f"1 and {N_THREADS} threads"
+        sys.stderr.write(f"\n=== engine: {engine} ({mode_label}) ===\n")
         for st, wgt, mask, label in cases:
             for mv in movings:
                 wtag = "__weight" if wgt else ""
                 out = os.path.join(out_dir, f"{stem(mv)}__to__{stem(st)}__{engine}{wtag}.nii.gz")
                 row = [label, stem(mv)]
                 res = {}
-                for tag, threads in (("1", 1), ("n", N_THREADS)):
+                runs = (("n", N_THREADS),) if args.multi_only else (
+                    ("1", 1), ("n", N_THREADS))
+                for tag, threads in runs:
                     sys.stderr.write(f"  {stem(mv):16s} -> {label:18s} [{engine:9s} {tag:>2s}] ... ")
                     sys.stderr.flush()
                     r = ENGINES[engine](mv, st, out, threads, args.allineate, args.timeout,
@@ -284,7 +306,7 @@ def main():
                     else:
                         res[tag] = r
                         sys.stderr.write(f"{r[0]:.1f}s, {_fmt(r[1], 0)} MB\n")
-                t1, ram1 = res["1"]
+                t1, ram1 = res.get("1", (None, None))
                 tn, ramn = res["n"]
                 speedup = (t1 / tn) if (t1 and tn) else None
                 # Quality scored on the N-thread output (deterministic for allineate/fast).
@@ -297,11 +319,17 @@ def main():
 
     # Copy-pasteable markdown to stdout.
     print(f"Benchmark on {os.uname().sysname} {os.uname().machine} "
-          f"({len(movings)} moving x {len(stationaries)} stationary; N = {N_THREADS} threads).\n")
-    print("**Legend** — *Time* in seconds (end-to-end, includes read/write); *Peak RAM* in MB "
-          "(peak RSS); *Speed Up* = 1-thread Time / N-thread Time; *Cost* / *Cost Masked* = "
-          "Hellinger-affinity match quality (higher = better; masked restricts to the template "
-          f"brain mask). The `1` columns are single-thread, the `{N_THREADS}` columns use all cores.\n")
+          f"({len(movings)} moving x {len(cases)} base cases; N = {N_THREADS} threads).\n")
+    if args.multi_only:
+        print("**Legend** — *Time* in seconds (end-to-end, includes read/write); *Peak RAM* in MB "
+              "(peak RSS); *Cost* / *Cost Masked* = Hellinger-affinity match quality "
+              "(higher = better; masked restricts to the template brain mask). "
+              f"All registrations use {N_THREADS} threads.\n")
+    else:
+        print("**Legend** — *Time* in seconds (end-to-end, includes read/write); *Peak RAM* in MB "
+              "(peak RSS); *Speed Up* = 1-thread Time / N-thread Time; *Cost* / *Cost Masked* = "
+              "Hellinger-affinity match quality (higher = better; masked restricts to the template "
+              f"brain mask). The `1` columns are single-thread, the `{N_THREADS}` columns use all cores.\n")
     wsuf = " + `-weight`" if args.weight else ""
     titles = {"allineate": "allineate ordinary engine (`-cost hel`)" + wsuf,
               "fast": "fast mixed coarse (`-cost fast`, the default)" + wsuf,
@@ -311,7 +339,7 @@ def main():
               "afni": "AFNI 3dAllineate (reference, defaults)" + wsuf}
     for engine in engines:
         print(f"### {titles[engine]}\n")
-        print(markdown_table(tables[engine]) + "\n")
+        print(markdown_table(tables[engine], multi_only=args.multi_only) + "\n")
 
     if n_fail:
         sys.stderr.write(f"\n{n_fail} registration(s) FAILED/timed out.\n")

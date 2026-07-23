@@ -2,7 +2,7 @@
 """Benchmark the default fast strategy specifically on hard-zeroed bases.
 
 The ordinary benchmark's whole-head templates cannot expose the coarse rigid-vs-scale
-failure described in weighted.md. This script evaluates the committed SSW base plus
+failure. This script evaluates the committed SSW base plus
 brain-only versions of both committed templates. The stripped bases are generated in a
 temporary directory from the tracked templates and masks; no duplicate NIfTI data is kept.
 
@@ -35,18 +35,63 @@ def load(path):
     return nib.load(path).get_fdata(dtype=np.float32)
 
 
+def hardzero_fraction(data):
+    """Match the engine's full-resolution exact-minimum-mass gate."""
+    values = np.asarray(data)
+    if values.size == 0 or not np.all(np.isfinite(values)):
+        return 0.0
+    minimum = values.min()
+    return float(np.count_nonzero(values == minimum)) / values.size
+
+
+def require_hardzero(data, label):
+    fraction = hardzero_fraction(data)
+    if not fraction > 0.25:
+        raise ValueError(
+            f"{label} is not hard-zeroed by the engine's criterion "
+            f"(exact-minimum fraction {fraction:.4f}, requires >0.25)"
+        )
+    return fraction
+
+
 def make_stripped(template_path, mask_path, out_path):
     template = nib.load(template_path)
     data = np.asarray(template.dataobj, dtype=np.float32)
     mask = load(mask_path) > 0.5
-    out = nib.Nifti1Image(np.where(mask, data, 0.0).astype(np.float32),
+    stripped = np.where(mask, data, 0.0).astype(np.float32)
+    require_hardzero(stripped, out_path)
+    out = nib.Nifti1Image(stripped,
                           template.affine, template.header)
     out.set_data_dtype(np.float32)
     nib.save(out, out_path)
     return out_path, mask_path
 
 
-def run_case(exe, moving, base, mask_path, threads, timeout, out_path):
+def masked_ncc(aligned, fixed, mask):
+    x = np.asarray(aligned[mask], dtype=np.float64)
+    y = np.asarray(fixed[mask], dtype=np.float64)
+    if x.size < 2 or y.size != x.size or not (
+            np.all(np.isfinite(x)) and np.all(np.isfinite(y))):
+        return None
+    x -= x.mean()
+    y -= y.mean()
+    denom = float(np.sqrt(np.dot(x, x) * np.dot(y, y)))
+    if not denom > 0.0 or not np.isfinite(denom):
+        return None
+    value = float(np.dot(x, y) / denom)
+    return value if np.isfinite(value) else None
+
+
+def format_ncc(ncc, same_modal):
+    if not same_modal:
+        return "—", False
+    if ncc is None:
+        return "FAIL", True
+    return f"{ncc:.4f}", False
+
+
+def run_case(exe, moving, base, mask_path, threads, timeout, out_path,
+             compute_ncc):
     t0 = time.perf_counter()
     try:
         proc = subprocess.run([exe, moving, base, "-p", str(threads), out_path],
@@ -63,7 +108,7 @@ def run_case(exe, moving, base, mask_path, threads, timeout, out_path):
     if aligned.shape != fixed.shape or mask.shape != fixed.shape:
         return None, "grid mismatch"
     hel = hellinger_quality(aligned, fixed, mask)
-    ncc = float(np.corrcoef(aligned[mask], fixed[mask])[0, 1])
+    ncc = masked_ncc(aligned, fixed, mask) if compute_ncc else None
     return (elapsed, hel, ncc), None
 
 
@@ -114,22 +159,32 @@ def main():
                 os.path.join(templates_dir, template_name),
                 os.path.join(masks_dir, mask_name),
                 os.path.join(tmp, label + ".nii.gz"))))
+        for label, base, _mask in cases:
+            require_hardzero(load(base), label)
 
         print("| Moving | Base | Time | Masked Hellinger | Masked NCC |")
         print("|---|---|---:|---:|---:|")
         for label, base, mask in cases:
             for moving in movings:
                 name = stem(moving)
+                same_modal = name.lower().startswith("t1")
                 out = os.path.join(tmp, f"{name}__to__{label}.nii.gz")
                 result, error = run_case(args.allineate, moving, base, mask,
-                                         args.threads, args.timeout, out)
+                                         args.threads, args.timeout, out,
+                                         same_modal)
                 if result is None:
                     failures += 1
                     print(f"| {name} | {label} | FAIL | — | — |")
                     sys.stderr.write(f"{name} -> {label}: {error}\n")
                     continue
                 elapsed, hel, ncc = result
-                ncc_text = f"{ncc:.4f}" if name.lower().startswith("t1") else "—"
+                ncc_text, ncc_failed = format_ncc(ncc, same_modal)
+                if ncc_failed:
+                    failures += 1
+                    sys.stderr.write(
+                        f"{name} -> {label}: masked NCC unavailable "
+                        "(non-finite or zero-variance data)\n"
+                    )
                 print(f"| {name} | {label} | {elapsed:.2f} | {hel:.4f} | {ncc_text} |")
 
     raise SystemExit(1 if failures else 0)

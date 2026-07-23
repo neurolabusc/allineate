@@ -68,16 +68,28 @@ all:
 # known-transform fixtures derived from the bundled non-subject MNI atlas, then asserts the
 # geometry/preprocessing/affine paths. Exits nonzero on any failure, so CI or a release script
 # can gate on it. Needs python3 + numpy + nibabel.
+# Focused helper harnesses gate benchmark hard-zero/NCC behavior, deterministic NMS
+# ordering/separation, and overflow-safe NEWUOA workspace sizing.
 # The C-API harness links the estimator WITHOUT main.c to exercise coreg_fast_estimate()
 # with NULL opts (the default-options contract) — a path the CLI never takes. Built here so
 # `make test` also gates it; test_regression.py (§13) generates fixtures and runs it.
 CAPI_OUT = test_capi_nullopts
 QWCAPI_OUT = test_qwarp_capi
+NMS_OUT = test_coreg_fast_nms
+POWELL_OUT = test_powell_bounds
 test: all
-	$(CNAME) $(CFLAGS) $(OMPFLAGS) $(ZFLAGS) -I. test/test_capi_nullopts.c \
-		allineate.c nifti_io.c powell_newuoa.c miniCoreFLT.c coreg_fast.c \
+	python3 test/test_benchmark_tools.py
+	$(CNAME) $(CFLAGS) -I. test/test_coreg_fast_nms.c -lm -o $(NMS_OUT)
+	./$(NMS_OUT)
+	$(CNAME) $(CFLAGS) $(OMPFLAGS) -I. test/test_powell_bounds.c \
+		powell_newuoa.c $(OMPLINK) -lm -o $(POWELL_OUT)
+	./$(POWELL_OUT)
+	$(CNAME) $(CFLAGS) $(OMPFLAGS) $(ZFLAGS) -DCOREG_FAST_TEST_ALLOC \
+		-DAL_SIZE_MAX=UINT32_MAX -DAL_TEST_32BIT_SIZE -I. test/test_capi_nullopts.c \
+		allineate.c nifti_io.c powell_newuoa.c miniCoreFLT.c coreg_fast.c reface.c \
 		$(ZLIB) $(OMPLINK) -lm -o $(CAPI_OUT)
-	$(CNAME) $(CFLAGS) $(OMPFLAGS) $(ZFLAGS) -I. test/test_qwarp_capi.c \
+	$(CNAME) $(CFLAGS) $(OMPFLAGS) $(ZFLAGS) -DAL_SIZE_MAX=UINT32_MAX \
+		-DAL_TEST_32BIT_SIZE -I. test/test_qwarp_capi.c \
 		allineate.c nifti_io.c powell_newuoa.c miniCoreFLT.c coreg_fast.c qwarp.c \
 		$(ZLIB) $(OMPLINK) -lm -o $(QWCAPI_OUT)
 	python3 test/test_regression.py --allineate ./$(OUT)
@@ -104,7 +116,7 @@ test: all
 # SHARED_STABLE — shared drop-ins that MUST stay byte-identical with niimath; drift FAILS.
 # SHARED_LEADING — files intentionally ahead of niimath by an ACTIVE leading-edge feature;
 #   drift is only reported (does NOT fail). Currently empty (nothing is ahead).
-SHARED_STABLE  = powell_newuoa.c nifti_io.c nifti_io.h core32.h allineate.c allineate.h coreg_fast.c coreg_fast.h reface.c reface.h qwarp.c qwarp.h
+SHARED_STABLE  = powell_newuoa.c nifti_io.c nifti_io.h core32.h al_thread_local.h al_size_guard.h allineate.c allineate.h coreg_fast.c coreg_fast.h coreg_fast_nms.h reface.c reface.h qwarp.c qwarp.h
 SHARED_LEADING =
 parity:
 	@test -n "$(NIIMATH)" || { echo "set NIIMATH=/path/to/niimath (its src/ holds the source of truth)"; exit 2; }
@@ -147,4 +159,4 @@ profile: $(SRC)
 	$(CNAME) $(CFLAGS) $(OMPFLAGS) $(ZFLAGS) -DAL_PROFILE $(SRC) $(ZLIB) $(OMPLINK) -lm -o $(OUT)
 
 clean:
-	rm -f $(OUT) allineate.baseline test_capi_nullopts test_qwarp_capi *.o
+	rm -f $(OUT) allineate.baseline test_capi_nullopts test_qwarp_capi test_coreg_fast_nms test_powell_bounds *.o

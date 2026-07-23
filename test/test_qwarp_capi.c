@@ -86,6 +86,12 @@ int main(void) {
     { nifti_image *a = mk(30000, 8, 8, 1,0, 1,0), *b = mk(8,8,8, 1,0, 1,0);
       expect_reject("oversize dimension -> reject, *result NULL", a, b);
       nifti_image_free(a); nifti_image_free(b); }
+#ifdef AL_TEST_32BIT_SIZE
+    { nifti_image *a = mk(1024,1024,1025, 1,0, 1,0);
+      nifti_image *b = mk(1024,1024,1025, 1,0, 1,0);
+      expect_reject("wasm32 float-byte overflow -> reject, *result NULL", a, b);
+      nifti_image_free(a); nifti_image_free(b); }
+#endif
     { nifti_image *a = mk(3,3,3, 1,0, 1,0), *b = mk(3,3,3, 1,0, 1,0);
       expect_reject("too-small grid (<5) -> reject, *result NULL", a, b);
       nifti_image_free(a); nifti_image_free(b); }

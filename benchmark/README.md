@@ -14,15 +14,15 @@ A small, repeatable benchmark of registration quality/speed/memory on a fixed se
 All bundled imaging data is cleared for redistribution.
 
 - **Templates & masks** — `avg152T1`, `MNI152_T1_1mm`, and the brain masks are the standard FSL/MNI152 average atlases (non-subject, publicly redistributable under the FSL/MNI terms).
-- **Subject moving images** — `T1w1mm`, `T1w2mm`, `T2w`, `fmri` are de-identified and cleared by the data owner for sharing. `FLAIR_MICCAI2017` and `T1w_MICCAI2017` are the two local MICCAI benchmark additions used in the expanded results below.
+- **Subject moving images** — `T1w1mm`, `T1w2mm`, `T2w`, `fmri` are de-identified and cleared by the data owner for sharing. `FLAIR_MICCAI2017`, `T1w_MICCAI2017`, and the defaced/hard-zeroed `T1w_ARC2017` are the local benchmark additions used in the expanded results below.
 
-The `make test` correctness gate generates most fixtures on the fly. Its two fast-HEL accuracy cases derive deterministic known-transform fixtures from the bundled non-subject `avg152T1` atlas and mask; it does not gate on the subject scans or their descriptive benchmark scores.
+The `make test` correctness gate generates most fixtures on the fly. Its fast-HEL known-transform accuracy cases derive from the bundled non-subject `avg152T1` atlas and mask. It additionally gates the hard-zeroed-base multi-start with `T1w1mm` and the defaced/hard-zeroed `T1w_ARC2017` against a brain-only MNI base, requiring masked NCC ≥0.40; the broader benchmark scores remain descriptive.
 
 ## Inputs
 
 | role | images |
 |---|---|
-| moving | `FLAIR_MICCAI2017` (1.30×1.21×3 mm FLAIR, **cross-modal**), `T1w1mm` (0.9 mm T1), `T1w2mm` (2 mm T1), `T1w_MICCAI2017` (0.98×0.98×1.5 mm T1), `T2w` (1×1×2 mm T2, **cross-modal**), `fmri` (2.5×2.5×2 mm EPI, **cross-modal**) |
+| moving | `FLAIR_MICCAI2017` (1.30×1.21×3 mm FLAIR, **cross-modal**), `T1w1mm` (0.9 mm T1), `T1w2mm` (2 mm T1), `T1w_ARC2017` (defaced/hard-zeroed T1), `T1w_MICCAI2017` (0.98×0.98×1.5 mm T1), `T2w` (1×1×2 mm T2, **cross-modal**), `fmri` (2.5×2.5×2 mm EPI, **cross-modal**) |
 | stationary | `avg152T1` (2 mm), `MNI152_T1_1mm` (1 mm) |
 | weighted (default) | `weighted/<T>.nii.gz` paired with `weighted/<T>_weight.nii.gz` — each input is also registered to `<T>` with `-weight <T>_weight` and scored inside the weight plateau (currently `MNI152_2009_SSW`) |
 
@@ -32,6 +32,7 @@ The `make test` correctness gate generates most fixtures on the fly. Its two fas
 make                          # build the release binary first
 cd benchmark
 python3 benchmark.py          # allineate + fast engines (needs numpy + nibabel)
+python3 benchmark.py --multi-only  # initial all-core regression sweep
 python3 benchmark.py --engine allineate  # ordinary AFNI-style engine (-cost hel) only
 python3 benchmark.py --engine fasthel    # HEL-only fast path
 python3 benchmark.py --engine fastx      # explicit mixed-default selector
@@ -52,7 +53,7 @@ python3 hardzero.py              # default binary, all available threads
 python3 hardzero.py -p 1         # deterministic serial comparison
 ```
 
-The script uses the committed SSW base and generates brain-only MNI152/avg152 bases in a temporary directory from the committed templates and masks. It reports masked Hellinger for every modality and masked NCC for T1 inputs. No stripped-image duplicates are stored. The four decisive same-modality checks currently reproduce the imported results: ARC→SSW 0.3357, T1w1mm→MNI-strip 0.4770, ARC→avg-strip 0.4972, and MICCAI→avg-strip 0.0994 NCC. See [weighted.md](weighted.md) for the failure analysis and before/after summary.
+The script uses the committed SSW base and generates brain-only MNI152/avg152 bases in a temporary directory from the committed templates and masks. It reports masked Hellinger for every modality and masked NCC for T1 inputs. No stripped-image duplicates are stored. The four decisive same-modality checks currently reproduce the imported results: ARC→SSW 0.3357, T1w1mm→MNI-strip 0.4770, ARC→avg-strip 0.4972, and MICCAI→avg-strip 0.0994 NCC.
 
 Each engine runs every (stationary, moving) pair at **1 thread** and at **all cores** (N = `os.cpu_count()`), so one table per engine carries both the single- and multi-thread cost plus the speed-up. Match quality is a post-hoc **Hellinger-affinity** metric (`benchmark/hellinger.py`): the Hellinger distance of the joint 2D intensity histogram from independence — statistical DEPENDENCE between corresponding voxels (higher = better). Unlike NCC it assumes no linear intensity relationship, so it is valid for cross-modal pairs (T2/fMRI → T1) and comparable across engines (it is independent of each engine's own registration cost).
 
@@ -79,49 +80,47 @@ This historical table is the HEL-only path now selected with `-cost fasthel`. It
 | avg152T1 | T2w | 1.5 | 68 | 0.4 | 69 | 3.5x | 0.4412 | 0.2429 |
 | avg152T1 | fmri | 1.4 | 32 | 0.4 | 34 | 3.7x | 0.4281 | 0.2773 |
 
-### mixed default (`fast`/`fastx`) versus `fasthel` (14-thread capture check)
+### mixed default (`fast`/`fastx`)
 
-This targeted sweep uses only the 14-thread mode and compares the post-hoc masked Hellinger score. The four mixed coarse candidates run concurrently, so the observed end-to-end overhead over `fasthel` is generally only 0.00–0.09 s here (3.7% on average). No case changed basin catastrophically: the largest masked loss was −0.0053 (`T1w2mm→avg152T1`) and the largest gain was +0.0037 (`T1w2mm→MNI152_T1_1mm`). On the motivating hard-zeroed `M2017_test_T1w→MNI152_T1_1mm` case, which is not part of the bundled sweep, the mixed default recovered masked-brain NCC 0.4045 (determinant 0.696) instead of the failed HEL basin near NCC 0.105.
+The mixed default stays at whole-head baseline speed while activating the deeper three-strategy search only for a hard-zeroed base. On the 18 pre-existing rows, masked quality is unchanged apart from ±0.0002 movement on two weighted rows. The new defaced/hard-zeroed ARC2017 input aligns comparably to the ordinary engine on both whole-head bases and slightly better on weighted SSW (0.1702 versus 0.1665 masked Hellinger), while running roughly 19–102× faster serially.
 
-| Stationary | Moving | fasthel Time | default Time | Δ Time | fasthel Masked | default Masked | Δ Masked |
-|---|---|---|---|---|---|---|---|
-| MNI152_T1_1mm | FLAIR_MICCAI2017 | 1.06 | 1.11 | +0.05 | 0.2209 | 0.2202 | -0.0008 |
-| MNI152_T1_1mm | T1w1mm | 1.28 | 1.37 | +0.09 | 0.2074 | 0.2064 | -0.0010 |
-| MNI152_T1_1mm | T1w2mm | 1.01 | 1.01 | -0.01 | 0.2082 | 0.2118 | +0.0037 |
-| MNI152_T1_1mm | T1w_MICCAI2017 | 1.20 | 1.21 | +0.01 | 0.1751 | 0.1751 | +0.0000 |
-| MNI152_T1_1mm | T2w | 0.90 | 0.92 | +0.02 | 0.1777 | 0.1781 | +0.0004 |
-| MNI152_T1_1mm | fmri | 0.74 | 0.79 | +0.04 | 0.2119 | 0.2119 | +0.0000 |
-| avg152T1 | FLAIR_MICCAI2017 | 0.47 | 0.49 | +0.02 | 0.2919 | 0.2919 | +0.0000 |
-| avg152T1 | T1w1mm | 0.63 | 0.65 | +0.03 | 0.2586 | 0.2586 | +0.0000 |
-| avg152T1 | T1w2mm | 0.44 | 0.39 | -0.04 | 0.2802 | 0.2749 | -0.0053 |
-| avg152T1 | T1w_MICCAI2017 | 0.63 | 0.65 | +0.02 | 0.2272 | 0.2272 | +0.0000 |
-| avg152T1 | T2w | 0.38 | 0.38 | -0.01 | 0.2429 | 0.2449 | +0.0020 |
-| avg152T1 | fmri | 0.31 | 0.34 | +0.03 | 0.2773 | 0.2800 | +0.0027 |
-| MNI152_2009_SSW +w | FLAIR_MICCAI2017 | 1.12 | 1.17 | +0.05 | 0.1548 | 0.1548 | +0.0000 |
-| MNI152_2009_SSW +w | T1w1mm | 1.39 | 1.47 | +0.08 | 0.1725 | 0.1734 | +0.0009 |
-| MNI152_2009_SSW +w | T1w2mm | 1.07 | 1.15 | +0.08 | 0.2042 | 0.2041 | -0.0002 |
-| MNI152_2009_SSW +w | T1w_MICCAI2017 | 1.40 | 1.43 | +0.04 | 0.1436 | 0.1436 | +0.0000 |
-| MNI152_2009_SSW +w | T2w | 0.97 | 1.00 | +0.03 | 0.1530 | 0.1530 | +0.0000 |
-| MNI152_2009_SSW +w | fmri | 0.80 | 0.85 | +0.05 | 0.1378 | 0.1378 | +0.0000 |
+| Stationary | Moving | 1 Time | 1 Peak RAM | 14 Time | 14 Peak RAM | Speed Up | Cost | Cost Masked |
+|---|---|---|---|---|---|---|---|---|
+| MNI152_T1_1mm | FLAIR_MICCAI2017 | 2.6 | 159 | 1.2 | 160 | 2.2x | 0.4340 | 0.2202 |
+| MNI152_T1_1mm | T1w1mm | 2.7 | 295 | 1.3 | 297 | 2.1x | 0.4801 | 0.2064 |
+| MNI152_T1_1mm | T1w2mm | 2.3 | 134 | 1.0 | 135 | 2.3x | 0.4742 | 0.2118 |
+| MNI152_T1_1mm | T1w_ARC2017 | 2.4 | 269 | 0.9 | 269 | 2.6x | 0.4570 | 0.1820 |
+| MNI152_T1_1mm | T1w_MICCAI2017 | 2.5 | 288 | 1.2 | 289 | 2.1x | 0.4394 | 0.1751 |
+| MNI152_T1_1mm | T2w | 2.2 | 156 | 0.9 | 157 | 2.4x | 0.4161 | 0.1781 |
+| MNI152_T1_1mm | fmri | 1.8 | 121 | 0.7 | 121 | 2.4x | 0.4035 | 0.2119 |
+| avg152T1 | FLAIR_MICCAI2017 | 2.0 | 73 | 0.5 | 71 | 4.1x | 0.4793 | 0.2919 |
+| avg152T1 | T1w1mm | 2.0 | 207 | 0.7 | 210 | 3.0x | 0.5095 | 0.2586 |
+| avg152T1 | T1w2mm | 1.5 | 46 | 0.4 | 46 | 4.0x | 0.5138 | 0.2749 |
+| avg152T1 | T1w_ARC2017 | 2.7 | 180 | 0.7 | 182 | 4.1x | 0.4758 | 0.2097 |
+| avg152T1 | T1w_MICCAI2017 | 2.1 | 199 | 0.6 | 200 | 3.3x | 0.4639 | 0.2272 |
+| avg152T1 | T2w | 1.5 | 67 | 0.4 | 68 | 4.0x | 0.4381 | 0.2449 |
+| avg152T1 | fmri | 1.5 | 31 | 0.3 | 33 | 4.5x | 0.4277 | 0.2800 |
 
 ### allineate Hellinger (`-cost hel`) is very similar to AFNI 3dAllineate
 
 | Stationary | Moving | 1 Time | 1 Peak RAM | 14 Time | 14 Peak RAM | Speed Up | Cost | Cost Masked |
 |---|---|---|---|---|---|---|---|---|
-| MNI152_T1_1mm | FLAIR_MICCAI2017 | 159.5 | 277 | 22.3 | 541 | 7.1x | 0.4355 | 0.2185 |
-| MNI152_T1_1mm | T1w1mm | 147.9 | 460 | 22.9 | 714 | 6.5x | 0.4806 | 0.2119 |
-| MNI152_T1_1mm | T1w2mm | 98.7 | 194 | 13.4 | 436 | 7.4x | 0.4710 | 0.2202 |
-| MNI152_T1_1mm | T1w_MICCAI2017 | 251.3 | 437 | 37.9 | 743 | 6.6x | 0.4392 | 0.1722 |
-| MNI152_T1_1mm | T2w | 65.0 | 279 | 13.2 | 404 | 4.9x | 0.4185 | 0.1758 |
-| MNI152_T1_1mm | fmri | 20.2 | 190 | 4.5 | 255 | 4.5x | 0.4051 | 0.2114 |
-| avg152T1 | FLAIR_MICCAI2017 | 45.8 | 91 | 6.1 | 202 | 7.5x | 0.4819 | 0.2868 |
-| avg152T1 | T1w1mm | 38.4 | 222 | 6.8 | 285 | 5.7x | 0.5109 | 0.2627 |
-| avg152T1 | T1w2mm | 34.7 | 66 | 4.6 | 180 | 7.6x | 0.5123 | 0.2833 |
-| avg152T1 | T1w_MICCAI2017 | 64.2 | 201 | 9.0 | 321 | 7.1x | 0.4727 | 0.2287 |
-| avg152T1 | T2w | 22.5 | 85 | 3.9 | 146 | 5.8x | 0.4592 | 0.2257 |
-| avg152T1 | fmri | 18.5 | 44 | 2.6 | 111 | 7.1x | 0.4325 | 0.2700 |
+| MNI152_T1_1mm | FLAIR_MICCAI2017 | 160.8 | 259 | 22.4 | 538 | 7.2x | 0.4354 | 0.2167 |
+| MNI152_T1_1mm | T1w1mm | 135.1 | 460 | 22.8 | 661 | 5.9x | 0.4796 | 0.2115 |
+| MNI152_T1_1mm | T1w2mm | 103.7 | 195 | 14.2 | 439 | 7.3x | 0.4708 | 0.2204 |
+| MNI152_T1_1mm | T1w_ARC2017 | 245.8 | 424 | 58.5 | 723 | 4.2x | 0.4574 | 0.1828 |
+| MNI152_T1_1mm | T1w_MICCAI2017 | 288.3 | 386 | 40.9 | 744 | 7.0x | 0.4395 | 0.1722 |
+| MNI152_T1_1mm | T2w | 72.4 | 265 | 13.0 | 396 | 5.5x | 0.4192 | 0.1740 |
+| MNI152_T1_1mm | fmri | 20.0 | 190 | 4.6 | 246 | 4.3x | 0.4069 | 0.2098 |
+| avg152T1 | FLAIR_MICCAI2017 | 47.0 | 90 | 6.7 | 200 | 7.0x | 0.4823 | 0.2851 |
+| avg152T1 | T1w1mm | 42.5 | 222 | 7.0 | 315 | 6.0x | 0.5081 | 0.2640 |
+| avg152T1 | T1w2mm | 37.1 | 65 | 4.8 | 178 | 7.8x | 0.5124 | 0.2836 |
+| avg152T1 | T1w_ARC2017 | 66.4 | 193 | 10.2 | 308 | 6.5x | 0.4763 | 0.2135 |
+| avg152T1 | T1w_MICCAI2017 | 77.9 | 201 | 11.2 | 314 | 7.0x | 0.4729 | 0.2247 |
+| avg152T1 | T2w | 26.2 | 86 | 4.4 | 143 | 5.9x | 0.4600 | 0.2272 |
+| avg152T1 | fmri | 20.1 | 45 | 2.9 | 102 | 6.9x | 0.4338 | 0.2638 |
 
-### AFNI 3dAllineate (reference, defaults)
+### AFNI 3dAllineate (reference, defaults; historical, not re-run)
 
 | Stationary | Moving | 1 Time | 1 Peak RAM | 14 Time | 14 Peak RAM | Speed Up | Cost | Cost Masked |
 |---|---|---|---|---|---|---|---|---|
@@ -139,7 +138,7 @@ This targeted sweep uses only the 14-thread mode and compares the post-hoc maske
 | avg152T1 | fmri | 23.5 | 98 | 17.0 | 92 | 1.4x | 0.4400 | 0.2331 |
 
 
-### FLIRT (FSL, reference, defaults)
+### FLIRT (FSL, reference, defaults; historical, not re-run)
 
 `flirt -in <mov> -ref <fix> -out out` (FSL 12-DOF affine, defaults; FLIRT optimizes correlation-ratio internally). FLIRT is single-threaded, so the parallel-thread columns (`14 Time` / `14 Peak RAM` / `Speed Up`) are omitted; *Time* and *Peak RAM* are its single-thread figures. As in every table here, *Cost* / *Cost Masked* are the post-hoc **Hellinger-affinity** goodness-of-fit (not FLIRT's internal correlation-ratio), so the quality column is directly comparable across all engines.
 
@@ -166,31 +165,33 @@ These tables isolate the `-weight` option: each engine registers every moving im
 python3 benchmark.py            # plain templates + the weighted/ pair, both engines
 ```
 
-The base is the same for both allineate tables, so *Cost* / *Cost Masked* are directly comparable **between `-cost hel` and `-cost fasthel`** but **not** against the plain-template tables above (those use `avg152T1`/`MNI152_T1_1mm` bases; the SSW base includes the whole head, which dilutes the Hellinger score). The masked ROI here is the weight's own brain plateau (`weight > 0.3*max`), not an external brain-mask file. The AFNI + `-weight` reference table below is a **historical reference on the earlier `MNI152_2009_template_SSW1` base** (from the removed `weight/` dev folder); it was NOT re-run and is not directly comparable to the two allineate tables above it.
+The base is the same for both current allineate tables, so *Cost* / *Cost Masked* are directly comparable **between ordinary `-cost hel` and the mixed fast default** but **not** against the plain-template tables above (those use `avg152T1`/`MNI152_T1_1mm` bases; the SSW base includes the whole head, which dilutes the Hellinger score). The masked ROI here is the weight's own brain plateau (`weight > 0.3*max`), not an external brain-mask file. The AFNI + `-weight` reference table below is a **historical reference on the earlier `MNI152_2009_template_SSW1` base** (from the removed `weight/` dev folder); it was NOT re-run and is not directly comparable to the two current tables above it.
 
-**Reading them:** with the **weight-at-finest-level** fix (the graded weight now steers only the 2 mm stage; the 8 mm rigid coarse and 4 mm global-scale bracket stay whole-head — see `AGENTS.md`), the HEL-only fast engine no longer falls into the scalp-shrink basin. It now **matches or beats the ordinary `-cost hel` engine on every masked score** here — same-modality T1 (`T1w1mm` 0.173 vs 0.171, `T1w2mm` 0.204 vs 0.198, `T1w_MICCAI2017` 0.144 vs 0.137) and, more notably, the cross-modal rows (`T2w` 0.153 vs 0.113, `FLAIR_MICCAI2017` 0.155 vs 0.142, `fmri` 0.138 vs 0.124) — while running ~30–60× faster (~1–3 s vs 20–130 s). The earlier collapse (`T1w2mm`/`T1w_MICCAI2017`/`T2w` masked ~0.09–0.10) is gone. All rows still score lower than the plain-template tables because the SSW base includes the whole head (which dilutes the Hellinger score).
+**Reading them:** with weight restricted to the finest level and the hard-zeroed-base multi-start active, the mixed fast engine **beats the ordinary `-cost hel` engine on every masked score** here, including the new defaced ARC input (0.1702 versus 0.1665), while running about 8–40× faster serially. The earlier weighted shrink collapse is absent. All rows still score lower than the plain-template tables because the SSW base includes the whole head, which dilutes the Hellinger score.
 
 ### allineate ordinary engine (`-cost hel`) + `-weight`
 
 | Stationary | Moving | 1 Time | 1 Peak RAM | 14 Time | 14 Peak RAM | Speed Up | Cost | Cost Masked |
 |---|---|---|---|---|---|---|---|---|
-| MNI152_2009_SSW +w | FLAIR_MICCAI2017 | 109.4 | 293 | 15.8 | 519 | 6.9x | 0.2961 | 0.1421 |
-| MNI152_2009_SSW +w | T1w1mm | 61.2 | 414 | 15.4 | 526 | 4.0x | 0.3697 | 0.1712 |
-| MNI152_2009_SSW +w | T1w2mm | 78.6 | 230 | 11.3 | 395 | 7.0x | 0.3718 | 0.1982 |
-| MNI152_2009_SSW +w | T1w_MICCAI2017 | 131.3 | 390 | 20.9 | 611 | 6.3x | 0.3227 | 0.1370 |
-| MNI152_2009_SSW +w | T2w | 45.6 | 266 | 10.7 | 381 | 4.3x | 0.1895 | 0.1129 |
-| MNI152_2009_SSW +w | fmri | 19.5 | 186 | 4.5 | 258 | 4.4x | 0.2566 | 0.1238 |
+| MNI152_2009_SSW +w | FLAIR_MICCAI2017 | 118.6 | 291 | 19.6 | 520 | 6.1x | 0.2424 | 0.1347 |
+| MNI152_2009_SSW +w | T1w1mm | 63.8 | 410 | 14.5 | 529 | 4.4x | 0.3680 | 0.1722 |
+| MNI152_2009_SSW +w | T1w2mm | 81.8 | 230 | 12.4 | 388 | 6.6x | 0.3728 | 0.1981 |
+| MNI152_2009_SSW +w | T1w_ARC2017 | 69.3 | 372 | 17.0 | 489 | 4.1x | 0.1815 | 0.1665 |
+| MNI152_2009_SSW +w | T1w_MICCAI2017 | 146.0 | 313 | 23.9 | 609 | 6.1x | 0.3259 | 0.1387 |
+| MNI152_2009_SSW +w | T2w | 48.7 | 269 | 11.7 | 391 | 4.1x | 0.2667 | 0.1514 |
+| MNI152_2009_SSW +w | fmri | 18.4 | 186 | 4.3 | 243 | 4.3x | 0.2591 | 0.1231 |
 
-### fast HEL-only (`-cost fasthel`) + `-weight`
+### mixed fast default (`-cost fast`) + `-weight`
 
 | Stationary | Moving | 1 Time | 1 Peak RAM | 14 Time | 14 Peak RAM | Speed Up | Cost | Cost Masked |
 |---|---|---|---|---|---|---|---|---|
-| MNI152_2009_SSW +w | FLAIR_MICCAI2017 | 2.4 | 188 | 1.2 | 191 | 2.0x | 0.3259 | 0.1548 |
-| MNI152_2009_SSW +w | T1w1mm | 2.6 | 325 | 1.5 | 325 | 1.8x | 0.3633 | 0.1725 |
-| MNI152_2009_SSW +w | T1w2mm | 2.3 | 165 | 1.2 | 165 | 2.0x | 0.3614 | 0.2042 |
-| MNI152_2009_SSW +w | T1w_MICCAI2017 | 3.0 | 318 | 1.5 | 319 | 2.0x | 0.3370 | 0.1436 |
-| MNI152_2009_SSW +w | T2w | 2.0 | 187 | 1.0 | 186 | 2.0x | 0.2570 | 0.1530 |
-| MNI152_2009_SSW +w | fmri | 1.7 | 148 | 0.8 | 145 | 2.1x | 0.2895 | 0.1378 |
+| MNI152_2009_SSW +w | FLAIR_MICCAI2017 | 3.0 | 190 | 1.4 | 201 | 2.2x | 0.3259 | 0.1548 |
+| MNI152_2009_SSW +w | T1w1mm | 3.7 | 335 | 1.8 | 328 | 2.1x | 0.3624 | 0.1732 |
+| MNI152_2009_SSW +w | T1w2mm | 3.4 | 165 | 1.4 | 177 | 2.4x | 0.3614 | 0.2042 |
+| MNI152_2009_SSW +w | T1w_ARC2017 | 3.5 | 300 | 1.3 | 300 | 2.7x | 0.1785 | 0.1702 |
+| MNI152_2009_SSW +w | T1w_MICCAI2017 | 3.8 | 329 | 1.7 | 319 | 2.3x | 0.3370 | 0.1436 |
+| MNI152_2009_SSW +w | T2w | 2.9 | 186 | 1.3 | 187 | 2.3x | 0.2570 | 0.1530 |
+| MNI152_2009_SSW +w | fmri | 2.4 | 145 | 1.1 | 148 | 2.2x | 0.2895 | 0.1378 |
 
 ### AFNI 3dAllineate (reference) + `-weight` — *historical, prior `SSW1` base (not re-run)*
 

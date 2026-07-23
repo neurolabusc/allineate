@@ -10,10 +10,10 @@ The partial-FOV cases crop one end of the moving acquisition while preserving it
 world coordinates. The true transform remains identity; the fit must not distort
 the affine merely to pull unavailable fixed anatomy inside the moving grid.
 
-The hard-zero case masks the tracked MNI template with its tracked brain mask and
-registers the tracked T1w1mm image. This is the compact regression for the coarse
-multi-start: rigid-only coarse capture lands in a wrong basin (masked NCC ~0.13),
-while carrying the scale-bracketed strategy to 2 mm recovers NCC ~0.48.
+The hard-zero cases mask the tracked MNI template with its tracked brain mask and
+register the tracked T1w1mm and defaced/hard-zeroed ARC2017 images. These are compact
+regressions for the coarse multi-start: rigid-only coarse capture lands in a wrong
+basin, while carrying the scale-bracketed strategy to 2 mm recovers masked NCC >0.40.
 """
 import argparse, os, sys, json, subprocess, tempfile, shutil
 import numpy as np, nibabel as nib
@@ -88,9 +88,9 @@ def run_partial_fov(cost, fixed, tmp):
     return cs.erms(M, np.eye(4)), None
 
 
-def run_hard_zero_base(tmp):
-    """Return (masked_ncc, p1_equals_p4, error) for the stripped-template regression."""
-    moving = os.path.join(ROOT, "benchmark", "inputs", "T1w1mm.nii.gz")
+def run_hard_zero_base(tmp, moving_name="T1w1mm.nii.gz", threads=(1, 4)):
+    """Return (masked_ncc, outputs_equal, error) for one stripped-template regression."""
+    moving = os.path.join(ROOT, "benchmark", "inputs", moving_name)
     template = os.path.join(ROOT, "benchmark", "templates", "MNI152_T1_1mm.nii.gz")
     mask_path = os.path.join(ROOT, "benchmark", "masks", "MNI152_T1_1mm_brain_mask.nii.gz")
     for path in (moving, template, mask_path):
@@ -107,20 +107,22 @@ def run_hard_zero_base(tmp):
     nib.save(base, base_path)
 
     outputs = []
-    for threads in (1, 4):
-        out = os.path.join(tmp, f"hardzero_p{threads}.nii.gz")
+    for nthread in threads:
+        tag = os.path.splitext(os.path.splitext(moving_name)[0])[0]
+        out = os.path.join(tmp, f"hardzero_{tag}_p{nthread}.nii.gz")
         try:
-            r = subprocess.run([BIN, moving, base_path, "-p", str(threads), out],
+            r = subprocess.run([BIN, moving, base_path, "-p", str(nthread), out],
                                capture_output=True, text=True, timeout=120)
         except subprocess.TimeoutExpired:
-            return None, False, f"p{threads} timeout (>120s)"
+            return None, False, f"p{nthread} timeout (>120s)"
         if r.returncode != 0 or not os.path.exists(out):
-            return None, False, f"p{threads}: {r.stderr.strip()[-120:]}"
+            return None, False, f"p{nthread}: {r.stderr.strip()[-120:]}"
         outputs.append(np.asarray(nib.load(out).dataobj, dtype=np.float32))
 
     roi = md > 0.5
-    ncc = float(np.corrcoef(outputs[1][roi], td[roi])[0, 1])
-    return ncc, np.array_equal(outputs[0], outputs[1]), None
+    ncc = float(np.corrcoef(outputs[-1][roi], td[roi])[0, 1])
+    same = len(outputs) < 2 or all(np.array_equal(outputs[0], out) for out in outputs[1:])
+    return ncc, same, None
 
 
 def main():
@@ -161,6 +163,15 @@ def main():
             print(f"{'hardzero_p1=p4':14s}  {'yes' if same else 'no ':>7s}          "
                   f"{'PASS' if same else 'FAIL'}")
             npass += same; nfail += (not same)
+        arc_ncc, _same, err = run_hard_zero_base(
+            tmp, moving_name="T1w_ARC2017.nii.gz", threads=(4,))
+        if arc_ncc is None:
+            print(f"{'hardzero_arc':14s}   ---      0.40   FAIL ({err[:50]})")
+            nfail += 1
+        else:
+            ok = arc_ncc >= 0.40
+            print(f"{'hardzero_arc':14s}  {arc_ncc:7.3f}   0.40   {'PASS' if ok else 'FAIL'}")
+            npass += ok; nfail += (not ok)
         print(f"\n{npass} passed, {nfail} failed")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

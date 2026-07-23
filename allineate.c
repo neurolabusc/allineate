@@ -56,13 +56,10 @@ static int al_mul_size(size_t a, size_t b, size_t *out)
 #include "nifti_io.h"
 #include "allineate.h"
 #include "coreg_fast.h"   /* fast SPM/FLIRT-inspired engine, shared by -allineate and -deface */
+#include "al_thread_local.h"
+#include "al_size_guard.h"
 
-/* Thread-local storage qualifier for OpenMP safety */
-#ifdef _OPENMP
-#define AL_TLOCAL __thread
-#else
-#define AL_TLOCAL
-#endif
+#define AL_TLOCAL AL_THREAD_LOCAL
 
 /* Convert nifti_dmat44 (double) to mat44 (float) */
 static mat44 dmat44_to_mat44(nifti_dmat44 d) {
@@ -3026,9 +3023,12 @@ static int al_scalar_ransetup(GA_setup *stup, int nrand)
 #endif
     for (kk = 0; kk < ngood; kk++) {
         if (kval[kk] >= AL_BIGVAL) continue;
+        float old_mfac, old_afac;
+        powell_get_mfac(&old_mfac, &old_afac);
         powell_set_mfac(rs_mfac, rs_afac);
         int prc = powell_newuoa(nfr, kpar[kk], 0.05, 0.001, maxstep, GA_scalar_fitter);
         kval[kk] = (prc < 0) ? AL_BIGVAL : GA_scalar_fitter(nfr, kpar[kk]);  /* OOM -> not selectable */
+        powell_set_mfac(old_mfac, old_afac);
     }
     for (kk = 0; kk < ngood; kk++) {
         if (kval[kk] < vbest) { vbest = kval[kk]; jj = kk; }
@@ -3469,9 +3469,10 @@ static void al_center_of_mass(const float *data, int nx, int ny, int nz,
 
 
 /* Overflow-safe 3D voxel count (nx*ny*nz), kept within int range so the int loop
- * counters/indices used throughout allineate stay valid. NIfTI dims are int64; this
- * uses division-based checked multiplication so the product is never formed unless it
- * is provably <= INT_MAX. Returns 0 and sets *out on success, 1 (message) on failure. */
+ * counters/indices used throughout allineate stay valid and within the portable
+ * byte limit for float buffers. NIfTI dims are int64; this uses division-based
+ * checked multiplication so the product is never formed unless it is safe.
+ * Returns 0 and sets *out on success, 1 (message) on failure. */
 static int al_safe_nvox(const nifti_image *n, const char *who, size_t *out)
 {
     long long nx = n->nx, ny = n->ny, nz = n->nz;
@@ -3479,7 +3480,12 @@ static int al_safe_nvox(const nifti_image *n, const char *who, size_t *out)
         fprintf(stderr, "%s: non-positive dimensions\n", who); return 1; }
     if (nx > (long long)INT_MAX / ny || nx * ny > (long long)INT_MAX / nz) {
         fprintf(stderr, "%s: voxel count out of range\n", who); return 1; }
-    *out = (size_t)(nx * ny * nz);   /* proven <= INT_MAX */
+    uint64_t nv = (uint64_t)(nx * ny * nz);   /* proven positive and <= INT_MAX */
+    if (!al_float_nvox_fits(nv)) {
+        fprintf(stderr, "%s: voxel count exceeds addressable float-buffer range\n", who);
+        return 1;
+    }
+    *out = (size_t)nv;
     return 0;
 }
 
@@ -4266,10 +4272,13 @@ static int al_register(nifti_image *source, nifti_image *base,
         #pragma omp parallel for schedule(dynamic)
 #endif
         for (int ib = 0; ib < tfdone; ib++) {
+            float old_mfac, old_afac;
+            powell_get_mfac(&old_mfac, &old_afac);
             powell_set_mfac(mfac_m, mfac_a);
             int prc = powell_newuoa(nfr_ref, cand_wpar[ib], rstart_ref, rend_ref,
                          maxstep_ref, GA_scalar_fitter);
             tfcost[ib] = (prc < 0) ? AL_BIGVAL : (float)GA_scalar_fitter(nfr_ref, cand_wpar[ib]);
+            powell_set_mfac(old_mfac, old_afac);
         }
 
         /* Unpack results back to tfparm */
@@ -4388,9 +4397,12 @@ static int al_register(nifti_image *source, nifti_image *base,
         for (int ib = 0; ib < tfdone; ib++) {
             int maxstep = cand_rtb[ib];
             if (maxstep <= 4 * nfr + 5) maxstep = 6666;
+            float old_mfac, old_afac;
+            powell_get_mfac(&old_mfac, &old_afac);
             powell_set_mfac(fc_mfac, fc_afac);
             int prc = powell_newuoa(nfr, cand_wpar[ib], rad, 0.01 * rad, maxstep, GA_scalar_fitter);
             cand_cost[ib] = (prc < 0) ? AL_BIGVAL : (float)GA_scalar_fitter(nfr, cand_wpar[ib]);
+            powell_set_mfac(old_mfac, old_afac);
         }
 
         /* Unpack results back to ffparm */
