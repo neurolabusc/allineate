@@ -1096,7 +1096,13 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
        whereas on a hard-zeroed base they gain a mean 0.00857 (max 0.04586). Reuse the base
        detector that already gates the joint-foreground skip, so a whole-head base keeps the
        single-pass runtime and a stripped/defaced base gets the full search. */
-    int nstrat = (ctx.hel_mdark && O.cost != CF_COST_LS) ? CF_NSTRAT : 1;
+    /* The mixed default uses all three trajectories. Explicit fasthel/fastcr must remain
+       genuinely single-cost selectors, so they use only rigid + scale-bracketed strategies
+       and never inject the other cost through strategy 2. */
+    int nstrat = ctx.hel_mdark
+                   ? ((O.cost == CF_COST_HEL_CR) ? CF_NSTRAT :
+                      (O.cost == CF_COST_HEL || O.cost == CF_COST_CR) ? 2 : 1)
+                   : 1;
     for (int strat = 0; strat < nstrat; strat++) {
       ncand = 0;
       levels_done = 0;
